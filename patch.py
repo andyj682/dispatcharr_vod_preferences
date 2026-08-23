@@ -33,8 +33,9 @@ most-specific-first ladder:
      quality rank derived from the same per-stream signal the UI shows; the best
      becomes primary and failover follows quality order. Streams with no quality
      signal keep their native account-priority order (stable tiebreak). When
-     "prefer audio" is also on, audio rank (surround-first, then Dolby>AAC>other)
-     is a SECONDARY key that breaks ties among streams of the same video tier.
+     "prefer audio" is also on, audio rank (surround-first, then lossless >
+     Dolby > AAC > other) is a SECONDARY key that breaks ties among streams of
+     the same video tier.
   4. Native -- account priority, untouched.
 
 Composition: this plugin only reads/re-orders the relation list. It never
@@ -385,19 +386,37 @@ def quality_rank(relation, priority):
 # Dolby (AC-3 family) codec names as reported by ffprobe / provider probes.
 _AUDIO_DOLBY = {"ac3", "eac3", "e-ac-3", "ac-3"}
 
+# Lossless / high-bitrate formats, ranked ABOVE lossy Dolby/AAC. ffprobe reports
+# the whole DTS family (DTS, DTS-HD MA/HRA, DTS:X) as codec_name "dts", and Dolby
+# TrueHD as "truehd" (MLP is its lossless core; "dca" is an older name for DTS).
+_AUDIO_LOSSLESS = {"truehd", "mlp", "dts", "dca", "dts-hd"}
+
 # (channel_group, codec_group) -> rank, higher is better. Surround-first: ANY
-# multichannel beats ANY stereo; within a channel group Dolby > AAC > other.
-# Anything not classifiable (mono / unknown channel count, or no audio info) is
-# rank 0 -> keeps native stable order, so audio never reshuffles a stream it has
-# no opinion about.
+# multichannel beats ANY stereo; within a channel group lossless (TrueHD/DTS) >
+# Dolby (AC3/EAC3) > AAC > other. Anything not classifiable (mono / unknown
+# channel count, or no audio info) is rank 0 -> keeps native stable order, so
+# audio never reshuffles a stream it has no opinion about.
 _AUDIO_RANKS = {
-    ("surround", "dolby"): 6,
-    ("surround", "aac"): 5,
-    ("surround", "other"): 4,
+    ("surround", "lossless"): 8,
+    ("surround", "dolby"): 7,
+    ("surround", "aac"): 6,
+    ("surround", "other"): 5,
+    ("stereo", "lossless"): 4,
     ("stereo", "dolby"): 3,
     ("stereo", "aac"): 2,
     ("stereo", "other"): 1,
 }
+
+
+def _codec_group(codec):
+    """Bucket an ffprobe codec_name into lossless / dolby / aac / other."""
+    if codec.startswith("truehd") or codec == "mlp" or codec.startswith("dts") or codec == "dca":
+        return "lossless"
+    if codec in _AUDIO_DOLBY:
+        return "dolby"
+    if codec.startswith("aac"):
+        return "aac"
+    return "other"
 
 
 def _audio_dict(relation):
@@ -438,13 +457,7 @@ def _audio_group(a):
     else:
         chan = "other"
 
-    if codec in _AUDIO_DOLBY:
-        cod = "dolby"
-    elif codec.startswith("aac"):
-        cod = "aac"
-    else:
-        cod = "other"
-    return chan, cod
+    return chan, _codec_group(codec)
 
 
 def audio_rank(relation):

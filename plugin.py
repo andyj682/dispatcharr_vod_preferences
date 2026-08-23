@@ -120,12 +120,12 @@ class Plugin:
                 "Break ties by audio format AMONG streams of the same video "
                 "quality. Only takes effect when 'Prefer quality' is set (it never "
                 "overrides video quality -- a higher-resolution stream always wins). "
-                "Order is surround-first, then Dolby over AAC: 5.1/7.1 Dolby "
-                "(AC3/EAC3) > 5.1/7.1 AAC > 5.1/7.1 other (e.g. DTS/TrueHD) > 2.0 "
-                "Dolby > 2.0 AAC > 2.0 other; streams with no readable audio info "
-                "keep their native order. Depends on per-stream audio metadata "
-                "(codec/channels), populated by an advanced/detailed refresh -- "
-                "dormant where it's absent."
+                "Order is surround-first, then lossless over Dolby over AAC: 5.1/7.1 "
+                "lossless (TrueHD/DTS) > 5.1/7.1 Dolby (AC3/EAC3) > 5.1/7.1 AAC > "
+                "5.1/7.1 other > 2.0 lossless > 2.0 Dolby > 2.0 AAC > 2.0 other; "
+                "streams with no readable audio info keep their native order. "
+                "Depends on per-stream audio metadata (codec/channels), populated "
+                "by an advanced/detailed refresh -- dormant where it's absent."
             ),
         },
         {

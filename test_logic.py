@@ -529,22 +529,28 @@ def test_dims_cinemascope_tolerance():
 def test_audio_rank():
     print("test_audio_rank")
     q = lambda **kw: patch.audio_rank(FakeRelation(1, 1, "a", **kw))
+    # surround: lossless > dolby > aac > other
+    r_sl = q(audio=AUD("truehd", 8, "7.1"))
     r_sd = q(audio=AUD("eac3", 6))
     r_sa = q(audio=AUD("aac", 6))
-    r_so = q(audio=AUD("dts", 8, "7.1"))
+    r_so = q(audio=AUD("opus", 6))
+    # stereo: lossless > dolby > aac > other
+    r_tl = q(audio=AUD("dts", 2))
     r_td = q(audio=AUD("ac3", 2))
     r_ta = q(audio=AUD("aac", 2))
     r_to = q(audio=AUD("mp3", 2))
-    check("surround Dolby is the top rank", r_sd == 6)
-    check("ranks strictly descend: sfx Dolby>AAC>other > stereo Dolby>AAC>other",
-          r_sd > r_sa > r_so > r_td > r_ta > r_to)
+    check("surround lossless (TrueHD) is the top rank", r_sl == 8)
+    check("full order descends lossless>dolby>aac>other, surround before stereo",
+          r_sl > r_sd > r_sa > r_so > r_tl > r_td > r_ta > r_to)
     check("stereo/other still ranked above nothing", r_to == 1)
-    check("mono (other channels) -> 0", q(audio=AUD("ac3", 1)) == 0)
+    check("DTS classified lossless (top of surround)", q(audio=AUD("dts", 6)) == 8)
+    check("TrueHD classified lossless", q(audio=AUD("truehd", 6)) == 8)
+    check("mono (other channels) -> 0", q(audio=AUD("truehd", 1)) == 0)
     check("no audio info -> 0", patch.audio_rank(FakeRelation(1, 1, "a")) == 0)
     check("channel_layout drives surround when channels missing",
-          q(audio=AUD("eac3", None, "5.1(side)")) == 6)
-    check("surround-first: DTS 5.1 outranks AAC 2.0",
-          q(audio=AUD("dts", 6)) > q(audio=AUD("aac", 2)))
+          q(audio=AUD("eac3", None, "5.1(side)")) == 7)
+    check("surround-first: lossy MP3 5.1 still outranks lossless DTS 2.0",
+          q(audio=AUD("mp3", 6)) > q(audio=AUD("dts", 2)))
 
 
 def test_audio_tiebreak_within_tier():

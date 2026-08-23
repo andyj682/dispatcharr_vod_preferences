@@ -74,9 +74,10 @@ Plugins page → **Dispatcharr VOD Preferences** → **Settings** tab:
 - **Prefer better audio (tiebreaker)** — on/off (default **off**). Breaks ties by
   audio format *among streams of the same video quality tier*; it never overrides
   video quality and only takes effect when **Prefer quality** is set. Order is
-  surround-first, then Dolby over AAC: 5.1/7.1 Dolby (AC3/EAC3) → 5.1/7.1 AAC →
-  5.1/7.1 other (e.g. DTS/TrueHD) → 2.0 Dolby → 2.0 AAC → 2.0 other; streams with
-  no readable audio metadata keep their native order. Reads per-stream
+  surround-first, then lossless → Dolby → AAC: 5.1/7.1 lossless (TrueHD/DTS) →
+  5.1/7.1 Dolby (AC3/EAC3) → 5.1/7.1 AAC → 5.1/7.1 other → 2.0 lossless → 2.0
+  Dolby → 2.0 AAC → 2.0 other; streams with no readable audio metadata keep their
+  native order. Reads per-stream
   codec/channels from the probe data (populated by an advanced/detailed refresh),
   so it's dormant where that metadata is absent.
 - **Title key to clear** — a text box used only by the **Clear one** action below.
@@ -102,7 +103,7 @@ most-specific-first:
 |---|------|---------------|
 | 1 | **Explicit request pick** | The request named a specific stream (`stream_id`, movie UI play) or provider (`m3u_account_id`, series/episode UI play). Passed through untouched; if *Remember my UI pick* is on, it's saved as this title's default. |
 | 2 | **Saved UI pick** | A remembered pick for this title. **Movies** pin the exact `(provider, stream)`. **TV pins the provider for the whole series** and still applies the quality rule *within* that provider (so Prefer 4K picks the 4K copy when one provider carries both). Dropped automatically if the provider no longer carries the title. |
-| 3 | **Quality rule** | *Prefer quality* is set. Candidates are stable-sorted by quality; the best becomes primary and failover follows quality order. With *Prefer better audio* on, audio format is a secondary key that breaks ties among streams of the same video tier (surround-first, then Dolby > AAC). |
+| 3 | **Quality rule** | *Prefer quality* is set. Candidates are stable-sorted by quality; the best becomes primary and failover follows quality order. With *Prefer better audio* on, audio format is a secondary key that breaks ties among streams of the same video tier (surround-first, then lossless > Dolby > AAC). |
 | 4 | **Native** | None of the above — untouched account priority. |
 
 Streams with no quality signal keep their native account-priority order (the sort

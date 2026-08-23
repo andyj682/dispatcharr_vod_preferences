@@ -13,10 +13,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   breaks ties by audio format *among streams of the same video quality tier*. It
   never overrides video quality (a higher-resolution stream always wins) and only
   takes effect when **Prefer quality** is set. Ordering is surround-first, then
-  Dolby over AAC: 5.1/7.1 Dolby (AC3/EAC3) → 5.1/7.1 AAC → 5.1/7.1 other (e.g.
-  DTS/TrueHD) → 2.0 Dolby → 2.0 AAC → 2.0 other; streams with no readable audio
-  metadata keep their native order. When no video signal exists but audio does,
-  audio can decide the pick instead of falling through to native.
+  lossless → Dolby → AAC: 5.1/7.1 lossless (TrueHD/DTS) → 5.1/7.1 Dolby (AC3/EAC3)
+  → 5.1/7.1 AAC → 5.1/7.1 other → 2.0 lossless → 2.0 Dolby → 2.0 AAC → 2.0 other;
+  streams with no readable audio metadata keep their native order. When no video
+  signal exists but audio does, audio can decide the pick instead of falling
+  through to native.
 - The per-selection DEBUG log line now includes the chosen stream's audio
   (`audio=<codec>/<n>ch`), and **Check status** reports `prefer_audio`.
 
