@@ -471,6 +471,48 @@ def test_prefer_1080p_differs():
           [c.id for c in cands] == [r1080.id, r720.id, r4k.id])
 
 
+def test_prefer_720p_order():
+    print("test_prefer_720p_order")
+    reset(fields={"prefer_quality": "720p", "remember_ui_picks": False})
+    # native order: 4K, 1080p, 720p, 480p
+    r4k = FakeRelation(30, 1, "s4k", quality="4K")
+    r1080 = FakeRelation(31, 2, "s1080", quality="1080p")
+    r720 = FakeRelation(32, 3, "s720", quality="720p")
+    r480 = FakeRelation(33, 4, "s480", quality="480p")
+    scenario(FakeMovie(tmdb_id="100"), [r4k, r1080, r720, r480])
+    _, rel, cands = call()
+    check("prefer-720p picks the 720p stream", rel.id == r720.id)
+    check("prefer-720p order: 720p,480p,1080p,4K (step down before up, 4K last)",
+          [c.id for c in cands] == [r720.id, r480.id, r1080.id, r4k.id])
+
+    # 720p absent -> steps DOWN to 480p before UP to 1080p, 4K still last.
+    scenario(FakeMovie(tmdb_id="100"), [r4k, r1080, r480])
+    _, rel, cands = call()
+    check("prefer-720p with no 720p falls to 480p first", rel.id == r480.id)
+    check("prefer-720p failover 480p,1080p,4K",
+          [c.id for c in cands] == [r480.id, r1080.id, r4k.id])
+
+
+def test_dims_cinemascope_tolerance():
+    print("test_dims_cinemascope_tolerance")
+    # A cropped 2.39:1 1080p master is often a few px under 1920 wide. It must
+    # still classify as 1080p, not fall through to 720p on a strict < 1920 cut.
+    check("1918x800 cinemascope -> 1080p",
+          patch.quality_tier(FakeRelation(1, 1, "a", video={"width": 1918, "height": 800})) == "1080p")
+    check("1912x800 cinemascope -> 1080p",
+          patch.quality_tier(FakeRelation(1, 1, "a", video={"width": 1912, "height": 800})) == "1080p")
+    # 4K cinemascope a few px under 3840 stays 4K.
+    check("3836x1600 4K scope -> 4k",
+          patch.quality_tier(FakeRelation(1, 1, "a", video={"width": 3836, "height": 1600})) == "4k")
+    # Tolerance must NOT promote a genuine lower tier across the wide gap.
+    check("1280x720 stays 720p (not promoted to 1080p)",
+          patch.quality_tier(FakeRelation(1, 1, "a", video={"width": 1280, "height": 720})) == "720p")
+    check("1600x900 stays 720p (below 1080p tolerance band)",
+          patch.quality_tier(FakeRelation(1, 1, "a", video={"width": 1600, "height": 900})) == "720p")
+    check("854x480 stays 480p (not promoted to 720p)",
+          patch.quality_tier(FakeRelation(1, 1, "a", video={"width": 854, "height": 480})) == "480p")
+
+
 def test_quality_stable_for_unknowns():
     print("test_quality_stable_for_unknowns")
     reset(fields={"prefer_quality": "4k", "remember_ui_picks": False})
@@ -769,6 +811,8 @@ if __name__ == "__main__":
     test_multi_relation_episode_real_shape()
     test_quality_rule_reorders()
     test_prefer_1080p_differs()
+    test_prefer_720p_order()
+    test_dims_cinemascope_tolerance()
     test_quality_stable_for_unknowns()
     test_capture_and_persist_once()
     test_episode_capture_is_show_level()

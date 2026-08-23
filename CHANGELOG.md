@@ -5,6 +5,26 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.1.0] - 2026-08-09
+
+### Added
+
+- **Prefer 1080p** and **Prefer 720p** quality options alongside Prefer 4K. Each
+  targets its own tier when available, then steps down to lower tiers before up to
+  higher ones — so a bandwidth-minded choice never silently pulls a large 4K
+  stream. (The underlying tier ladder already existed; this exposes it in the
+  dropdown.) These take effect only where a resolution signal exists — real video
+  dimensions, or a provider that labels the tier — and otherwise stay dormant.
+
+### Fixed
+
+- Quality classification from measured video dimensions now allows a small
+  tolerance (5%) below each standard **width**, so a cropped 2.39:1
+  "cinemascope" 1080p master (commonly 1918/1912 px wide, just under the 1920
+  cutoff) is correctly read as 1080p instead of 720p. Standard heights stay
+  strict, and the tolerance can only promote a borderline stream to a higher tier
+  — never demote one — because adjacent standard widths are far apart.
+
 ## [1.0.0] - 2026-08-04
 
 Initial release.
@@ -48,4 +68,5 @@ Initial release.
   so the plugin can only choose among the streams Dispatcharr currently knows
   about; refresh a series to surface newly-added streams. Movies are unaffected.
 
+[1.1.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.1.0
 [1.0.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.0.0

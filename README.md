@@ -61,10 +61,14 @@ enable request; a restart patches all of them.
 
 Plugins page → **Dispatcharr VOD Preferences** → **Settings** tab:
 
-- **Prefer quality** — `Off` / `Prefer 4K`. Default `Off`. (Only these two are
-  exposed: on real provider data sub-4K streams carry no resolution label, so a
-  "Prefer 1080p" option would be misleading. The full tier ladder still lives in
-  the code if a provider ever labels sub-4K.)
+- **Prefer quality** — `Off` / `Prefer 4K` / `Prefer 1080p` / `Prefer 720p`.
+  Default `Off`. A chosen tier wins when available; otherwise the plugin steps
+  *down* to lower tiers before *up* to higher ones, so `Prefer 1080p`/`Prefer
+  720p` never silently pull a large 4K stream. Note that on many providers sub-4K
+  streams carry no resolution label, so `1080p`/`720p` only take effect once real
+  video dimensions are known (after an advanced/detailed refresh) or the provider
+  labels the tier; where no sub-4K signal exists they stay dormant (behave like
+  `Off`).
 - **Remember my UI pick** — on/off (default **on**). Governs both capturing new
   picks and applying stored ones.
 - **Title key to clear** — a text box used only by the **Clear one** action below.

@@ -132,11 +132,17 @@ _WH_RE = re.compile(r"(?<!\d)(\d{3,4})\s*[xX]\s*(\d{3,4})(?!\d)")
 
 # prefer_quality value -> ordered tier priority (best first). Anything not "off"
 # and not explicitly mapped is treated as 4K-first.
+#
+# The ordering rule for every entry is: [the target tier] + [all LOWER tiers,
+# quality-descending] + [all HIGHER tiers, quality-ascending]. So a target's own
+# tier wins, then we step DOWN before stepping UP, and the biggest (4K) file is
+# always last when the target isn't itself 4K -- this keeps a bandwidth-minded
+# "Prefer 1080p"/"Prefer 720p" from silently pulling a huge 4K stream.
 _QUALITY_PRIORITY = {
     "4k": ("4k", "1080p", "720p", "480p"),
-    # 1080p first, then quality-descending, with 4K LAST (avoids huge 4K files
-    # when the user explicitly wants 1080p).
     "1080p": ("1080p", "720p", "480p", "4k"),
+    "720p": ("720p", "480p", "1080p", "4k"),
+    "480p": ("480p", "720p", "1080p", "4k"),
 }
 
 # --------------------------------------------------------------------------- #
@@ -230,6 +236,18 @@ def _is_cover_image(v):
     return False
 
 
+# Cropped / mod-adjusted frames land a few percent under a nominal standard
+# WIDTH: a 2.39:1 "cinemascope" master cut from a 1920-wide source is commonly
+# 1918, 1916 or 1912 wide (mod-2/mod-16 encoder constraints, side crop), yet is
+# unmistakably a 1080p stream. A small tolerance on the width thresholds pulls
+# such frames up to the right tier. It is safe because adjacent standard widths
+# are ~30-50% apart (1280 vs 1920 vs 3840), far wider than the tolerance, so no
+# genuine lower-tier stream can cross a boundary. The tolerance only ever LOWERS
+# a width boundary, so it can only PROMOTE a borderline stream to a higher tier,
+# never demote one. Heights are the exact standard values and stay strict.
+_DIM_TOLERANCE = 0.05
+
+
 def _tier_from_dims(width, height):
     """Map video pixel dimensions to a tier (mirrors Dispatcharr's thresholds)."""
     try:
@@ -238,13 +256,18 @@ def _tier_from_dims(width, height):
     except (TypeError, ValueError):
         return None
     big = max(w, h)  # robust to width/height ordering
-    if big >= 3840 or h >= 2160:
+
+    def wide(threshold):
+        # >= the threshold, allowing a small crop/mod tolerance below it.
+        return big >= threshold * (1 - _DIM_TOLERANCE)
+
+    if wide(3840) or h >= 2160:
         return "4k"
-    if big >= 1920 or h >= 1080:
+    if wide(1920) or h >= 1080:
         return "1080p"
-    if big >= 1280 or h >= 720:
+    if wide(1280) or h >= 720:
         return "720p"
-    if big >= 854 or h >= 480:
+    if wide(854) or h >= 480:
         return "480p"
     return None
 

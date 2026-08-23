@@ -54,7 +54,7 @@ def _format_picks(picks):
 
 class Plugin:
     name = "Dispatcharr VOD Preferences"
-    version = "1.0.0"
+    version = "1.1.0"
     description = (
         "Greater control over which VOD stream Dispatcharr serves through its "
         "proxy for a given title (control not exposed to clients): prefer a "
@@ -77,17 +77,23 @@ class Plugin:
                 "quality/resolution, the provider stream name, and the M3U account "
                 "name -- so a '... 4K' provider, or a stream/title containing "
                 "'4K'/'2160p', is recognised, while a genuinely 1080p stream "
-                "mislabeled '4K' still ranks as 1080p. Streams with no quality "
-                "signal keep their native account-priority order."
+                "mislabeled '4K' still ranks as 1080p. A chosen tier wins when "
+                "available; otherwise lower tiers are tried before higher ones, so "
+                "'Prefer 1080p'/'Prefer 720p' won't pull a huge 4K stream. Streams "
+                "with no quality signal keep their native account-priority order. "
+                "Note: on many providers sub-4K streams carry no resolution label, "
+                "so 1080p/720p only take effect once real video dimensions are known "
+                "(after an advanced/detailed refresh) or the provider labels the tier."
             ),
-            # Only Off / Prefer 4K are exposed: on real provider data the sub-4K
-            # streams carry no resolution label, so finer tiers never light up and
-            # "Prefer 1080p" would be misleading. The full tier ladder still lives
-            # in patch.py (_QUALITY_PRIORITY) and a "1080p" value is still honoured
-            # if set -- re-add the option here if a provider ever labels sub-4K.
+            # The full tier ladder lives in patch.py (_QUALITY_PRIORITY). 1080p/720p
+            # depend on a resolution signal being present (real dims or a labelled
+            # tier); when a provider carries no sub-4K label they stay dormant and
+            # behave like Off, which is safe.
             "options": [
                 {"value": "off", "label": "Off (native account priority)"},
                 {"value": "4k", "label": "Prefer 4K"},
+                {"value": "1080p", "label": "Prefer 1080p"},
+                {"value": "720p", "label": "Prefer 720p"},
             ],
         },
         {
