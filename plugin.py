@@ -54,7 +54,7 @@ def _format_picks(picks):
 
 class Plugin:
     name = "Dispatcharr VOD Preferences"
-    version = "1.1.0"
+    version = "1.2.0"
     description = (
         "Greater control over which VOD stream Dispatcharr serves through its "
         "proxy for a given title (control not exposed to clients): prefer a "
@@ -109,6 +109,23 @@ class Plugin:
                 "default for every episode of the show). Applied ahead of the "
                 "quality rule; dropped automatically if the provider stops carrying "
                 "the title."
+            ),
+        },
+        {
+            "id": "prefer_audio",
+            "label": "Prefer better audio (tiebreaker)",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "Break ties by audio format AMONG streams of the same video "
+                "quality. Only takes effect when 'Prefer quality' is set (it never "
+                "overrides video quality -- a higher-resolution stream always wins). "
+                "Order is surround-first, then Dolby over AAC: 5.1/7.1 Dolby "
+                "(AC3/EAC3) > 5.1/7.1 AAC > 5.1/7.1 other (e.g. DTS/TrueHD) > 2.0 "
+                "Dolby > 2.0 AAC > 2.0 other; streams with no readable audio info "
+                "keep their native order. Depends on per-stream audio metadata "
+                "(codec/channels), populated by an advanced/detailed refresh -- "
+                "dormant where it's absent."
             ),
         },
         {
@@ -201,6 +218,7 @@ class Plugin:
                     f"(reflects ONE worker; check logs for all worker pids). "
                     f"prefer_quality={settings.get('prefer_quality', 'off')}, "
                     f"remember_ui_picks={settings.get('remember_ui_picks', True)}, "
+                    f"prefer_audio={settings.get('prefer_audio', False)}, "
                     f"saved_picks={len(_patch.get_saved_picks())}"
                 ),
             }

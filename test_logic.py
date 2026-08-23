@@ -192,7 +192,8 @@ class FakeAccount:
 
 class FakeRelation:
     def __init__(self, rid, account_id, stream_id, quality=None, resolution=None,
-                 name=None, info_title=None, video=None, account_name=None):
+                 name=None, info_title=None, video=None, account_name=None,
+                 audio=None):
         self.id = rid
         self.m3u_account_id = account_id
         self.stream_id = stream_id
@@ -206,7 +207,9 @@ class FakeRelation:
         if info_title is not None:  # provider episode title (info.title)
             props["info"] = {"title": info_title}
         if video is not None:  # detailed_info.video dims
-            props["detailed_info"] = {"video": video}
+            props.setdefault("detailed_info", {})["video"] = video
+        if audio is not None:  # detailed_info.audio (ffprobe-style dict)
+            props.setdefault("detailed_info", {})["audio"] = audio
         self.custom_properties = props
         # Only set m3u_account when a name is given, so relations that shouldn't
         # exercise the account-name rung simply don't have the attribute.
@@ -239,6 +242,16 @@ class FakeEpisode:
         )
         self.season_number = season_number
         self.episode_number = episode_number
+
+
+def AUD(codec, channels=None, layout=None):
+    """Build an ffprobe-style audio dict for tests."""
+    d = {"codec_name": codec}
+    if channels is not None:
+        d["channels"] = channels
+    if layout is not None:
+        d["channel_layout"] = layout
+    return d
 
 
 # --------------------------------------------------------------------------- #
@@ -511,6 +524,72 @@ def test_dims_cinemascope_tolerance():
           patch.quality_tier(FakeRelation(1, 1, "a", video={"width": 1600, "height": 900})) == "720p")
     check("854x480 stays 480p (not promoted to 720p)",
           patch.quality_tier(FakeRelation(1, 1, "a", video={"width": 854, "height": 480})) == "480p")
+
+
+def test_audio_rank():
+    print("test_audio_rank")
+    q = lambda **kw: patch.audio_rank(FakeRelation(1, 1, "a", **kw))
+    r_sd = q(audio=AUD("eac3", 6))
+    r_sa = q(audio=AUD("aac", 6))
+    r_so = q(audio=AUD("dts", 8, "7.1"))
+    r_td = q(audio=AUD("ac3", 2))
+    r_ta = q(audio=AUD("aac", 2))
+    r_to = q(audio=AUD("mp3", 2))
+    check("surround Dolby is the top rank", r_sd == 6)
+    check("ranks strictly descend: sfx Dolby>AAC>other > stereo Dolby>AAC>other",
+          r_sd > r_sa > r_so > r_td > r_ta > r_to)
+    check("stereo/other still ranked above nothing", r_to == 1)
+    check("mono (other channels) -> 0", q(audio=AUD("ac3", 1)) == 0)
+    check("no audio info -> 0", patch.audio_rank(FakeRelation(1, 1, "a")) == 0)
+    check("channel_layout drives surround when channels missing",
+          q(audio=AUD("eac3", None, "5.1(side)")) == 6)
+    check("surround-first: DTS 5.1 outranks AAC 2.0",
+          q(audio=AUD("dts", 6)) > q(audio=AUD("aac", 2)))
+
+
+def test_audio_tiebreak_within_tier():
+    print("test_audio_tiebreak_within_tier")
+    r_aac = FakeRelation(1, 1, "aac2", video={"width": 1920, "height": 1080}, audio=AUD("aac", 2))
+    r_ac3 = FakeRelation(2, 2, "ac3_51", video={"width": 1920, "height": 1080}, audio=AUD("eac3", 6))
+
+    # prefer_audio ON: 5.1 promoted ahead of AAC 2.0 within the same 1080p tier.
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False, "prefer_audio": True})
+    scenario(FakeMovie(tmdb_id="1"), [r_aac, r_ac3])  # native: aac first
+    _, rel, cands = call()
+    check("audio tiebreak promotes 5.1 within same video tier", rel.id == r_ac3.id)
+    check("failover follows audio order", [c.id for c in cands] == [r_ac3.id, r_aac.id])
+
+    # prefer_audio OFF: native order within the tier is preserved.
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False, "prefer_audio": False})
+    scenario(FakeMovie(tmdb_id="1"), [r_aac, r_ac3])
+    _, rel, _ = call()
+    check("prefer_audio off -> native order kept within tier", rel.id == r_aac.id)
+
+    # Video tier still dominates: a 4K/AAC-2.0 beats a 1080p/EAC3-5.1.
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False, "prefer_audio": True})
+    r_4k = FakeRelation(3, 3, "4kaac", video={"width": 3840, "height": 2160}, audio=AUD("aac", 2))
+    scenario(FakeMovie(tmdb_id="1"), [r_ac3, r_4k])  # native: 1080p eac3 first
+    _, rel, _ = call()
+    check("video tier dominates audio (4K AAC beats 1080p 5.1)", rel.id == r_4k.id)
+
+
+def test_audio_decides_when_no_video_signal():
+    print("test_audio_decides_when_no_video_signal")
+    r_stereo = FakeRelation(1, 1, "s2", audio=AUD("aac", 2))
+    r_surround = FakeRelation(2, 2, "s6", audio=AUD("ac3", 6))
+
+    # Quality pref set, prefer_audio on, NO video signal anywhere: audio alone
+    # drives the pick rather than falling through to native.
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False, "prefer_audio": True})
+    scenario(FakeMovie(tmdb_id="1"), [r_stereo, r_surround])  # native: stereo first
+    _, rel, _ = call()
+    check("audio decides when video is all-unknown", rel.id == r_surround.id)
+
+    # prefer_audio off + no video signal -> native (no reshuffle).
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False, "prefer_audio": False})
+    scenario(FakeMovie(tmdb_id="1"), [r_stereo, r_surround])
+    _, rel, _ = call()
+    check("no video signal + audio off -> native", rel.id == r_stereo.id)
 
 
 def test_quality_stable_for_unknowns():
@@ -813,6 +892,9 @@ if __name__ == "__main__":
     test_prefer_1080p_differs()
     test_prefer_720p_order()
     test_dims_cinemascope_tolerance()
+    test_audio_rank()
+    test_audio_tiebreak_within_tier()
+    test_audio_decides_when_no_video_signal()
     test_quality_stable_for_unknowns()
     test_capture_and_persist_once()
     test_episode_capture_is_show_level()

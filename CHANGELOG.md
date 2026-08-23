@@ -5,6 +5,28 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-08-11
+
+### Added
+
+- **Prefer better audio (tiebreaker)** — a new opt-in setting (default off) that
+  breaks ties by audio format *among streams of the same video quality tier*. It
+  never overrides video quality (a higher-resolution stream always wins) and only
+  takes effect when **Prefer quality** is set. Ordering is surround-first, then
+  Dolby over AAC: 5.1/7.1 Dolby (AC3/EAC3) → 5.1/7.1 AAC → 5.1/7.1 other (e.g.
+  DTS/TrueHD) → 2.0 Dolby → 2.0 AAC → 2.0 other; streams with no readable audio
+  metadata keep their native order. When no video signal exists but audio does,
+  audio can decide the pick instead of falling through to native.
+- The per-selection DEBUG log line now includes the chosen stream's audio
+  (`audio=<codec>/<n>ch`), and **Check status** reports `prefer_audio`.
+
+### Notes
+
+- Audio ranking reads per-stream `codec_name` / `channels` from the same probe
+  metadata the video-tier waterfall uses (`detailed_info` / `info.info`), which is
+  populated by an advanced/detailed refresh — so the tiebreak is dormant wherever
+  that metadata is absent.
+
 ## [1.1.0] - 2026-08-09
 
 ### Added
@@ -68,5 +90,6 @@ Initial release.
   so the plugin can only choose among the streams Dispatcharr currently knows
   about; refresh a series to surface newly-added streams. Movies are unaffected.
 
+[1.2.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.2.0
 [1.1.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.1.0
 [1.0.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.0.0

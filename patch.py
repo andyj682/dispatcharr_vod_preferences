@@ -32,7 +32,9 @@ most-specific-first ladder:
   3. Quality rule -- if "prefer quality" is set, stable-sort candidates by a
      quality rank derived from the same per-stream signal the UI shows; the best
      becomes primary and failover follows quality order. Streams with no quality
-     signal keep their native account-priority order (stable tiebreak).
+     signal keep their native account-priority order (stable tiebreak). When
+     "prefer audio" is also on, audio rank (surround-first, then Dolby>AAC>other)
+     is a SECONDARY key that breaks ties among streams of the same video tier.
   4. Native -- account priority, untouched.
 
 Composition: this plugin only reads/re-orders the relation list. It never
@@ -111,6 +113,7 @@ MAX_SAVED_PICKS = 10000
 
 DEFAULT_PREFER_QUALITY = "off"
 DEFAULT_REMEMBER_UI_PICKS = True
+DEFAULT_PREFER_AUDIO = False
 
 # Quality-token patterns, checked most-specific-first so "UHD"/"FHD" resolve
 # before the plain "HD" of the 720p tier. Each token must be bounded by a
@@ -376,6 +379,97 @@ def quality_rank(relation, priority):
 
 
 # --------------------------------------------------------------------------- #
+# Audio ranking (optional within-tier tiebreak)
+# --------------------------------------------------------------------------- #
+
+# Dolby (AC-3 family) codec names as reported by ffprobe / provider probes.
+_AUDIO_DOLBY = {"ac3", "eac3", "e-ac-3", "ac-3"}
+
+# (channel_group, codec_group) -> rank, higher is better. Surround-first: ANY
+# multichannel beats ANY stereo; within a channel group Dolby > AAC > other.
+# Anything not classifiable (mono / unknown channel count, or no audio info) is
+# rank 0 -> keeps native stable order, so audio never reshuffles a stream it has
+# no opinion about.
+_AUDIO_RANKS = {
+    ("surround", "dolby"): 6,
+    ("surround", "aac"): 5,
+    ("surround", "other"): 4,
+    ("stereo", "dolby"): 3,
+    ("stereo", "aac"): 2,
+    ("stereo", "other"): 1,
+}
+
+
+def _audio_dict(relation):
+    """Find an ffprobe-style 'audio' dict via the SAME per-stream detail
+    locations the video-tier waterfall uses (movies: 'detailed_info'; episodes:
+    'info'.'info'). Tolerates audio stored as a list of tracks (takes the first).
+    Returns None when no usable audio metadata exists (common until an
+    advanced/detailed refresh has probed the stream)."""
+    cp = _custom_props(relation)
+    detailed_info = cp.get("detailed_info") if isinstance(cp.get("detailed_info"), dict) else None
+    info = cp.get("info") if isinstance(cp.get("info"), dict) else None
+    basic_data = cp.get("basic_data") if isinstance(cp.get("basic_data"), dict) else None
+    dicts = [d for d in (detailed_info, info, basic_data) if d]
+    if info is not None and isinstance(info.get("info"), dict):
+        dicts.append(info["info"])
+    for d in dicts:
+        a = d.get("audio")
+        if isinstance(a, list):
+            a = next((x for x in a if isinstance(x, dict)), None)
+        if isinstance(a, dict):
+            return a
+    return None
+
+
+def _audio_group(a):
+    """Classify an audio dict into (channel_group, codec_group)."""
+    codec = str(a.get("codec_name") or "").strip().lower()
+    layout = str(a.get("channel_layout") or "").strip().lower()
+    try:
+        ch = int(a.get("channels") or 0)
+    except (TypeError, ValueError):
+        ch = 0
+
+    if ch >= 6 or "5.1" in layout or "6.1" in layout or "7.1" in layout:
+        chan = "surround"
+    elif ch == 2 or "stereo" in layout or layout == "2.0":
+        chan = "stereo"
+    else:
+        chan = "other"
+
+    if codec in _AUDIO_DOLBY:
+        cod = "dolby"
+    elif codec.startswith("aac"):
+        cod = "aac"
+    else:
+        cod = "other"
+    return chan, cod
+
+
+def audio_rank(relation):
+    """Rank a relation's audio (higher = better), surround-first then Dolby>AAC.
+
+    Returns 0 when there's no usable audio info, so the tiebreak only ever
+    reorders streams that actually carry an audio signal.
+    """
+    a = _audio_dict(relation)
+    if not a:
+        return 0
+    return _AUDIO_RANKS.get(_audio_group(a), 0)
+
+
+def _audio_label(relation):
+    """Short 'codec/Nch' label for logging, or None when no audio info."""
+    a = _audio_dict(relation)
+    if not a:
+        return None
+    codec = str(a.get("codec_name") or "?").strip().lower()
+    ch = a.get("channels")
+    return f"{codec}/{ch}ch" if ch not in (None, "") else codec
+
+
+# --------------------------------------------------------------------------- #
 # Title keys
 # --------------------------------------------------------------------------- #
 
@@ -569,6 +663,10 @@ def _load_config(force: bool = False) -> dict:
             settings.get("remember_ui_picks", DEFAULT_REMEMBER_UI_PICKS),
             DEFAULT_REMEMBER_UI_PICKS,
         ),
+        "prefer_audio": _as_bool(
+            settings.get("prefer_audio", DEFAULT_PREFER_AUDIO),
+            DEFAULT_PREFER_AUDIO,
+        ),
         "saved_picks": picks if isinstance(picks, dict) else {},
     }
     with _cfg_lock:
@@ -699,13 +797,22 @@ def _log_label(content_obj, relation):
     return f"as:{relation.m3u_account_id}:{relation.stream_id}"
 
 
-def _quality_ranked(candidates, prefer):
-    """Stable-sort candidates by the prefer_quality ladder (best first)."""
+def _quality_ranked(candidates, prefer, use_audio=False):
+    """Stable-sort candidates by the prefer_quality ladder (best first).
+
+    When *use_audio* is set, audio rank is a SECONDARY key: it breaks ties only
+    among streams of the same video tier (video quality still dominates). The
+    sort stays stable, so streams equal on both keys keep native order.
+    """
     priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"])
-    return sorted(candidates, key=lambda c: quality_rank(c, priority), reverse=True)
+    return sorted(
+        candidates,
+        key=lambda c: (quality_rank(c, priority), audio_rank(c) if use_audio else 0),
+        reverse=True,
+    )
 
 
-def _finalize_show_pick(chosen, candidates, prefer):
+def _finalize_show_pick(chosen, candidates, prefer, use_audio=False):
     """A TV show pick names a PROVIDER (account). Keep that provider, but still
     honour the quality rule WITHIN it -- so when one provider carries both the 4K
     and non-4K copy of an episode, Prefer 4K picks the 4K stream. Fail over to
@@ -715,7 +822,7 @@ def _finalize_show_pick(chosen, candidates, prefer):
     same = [c for c in candidates if c.m3u_account_id == acct]
     other = [c for c in candidates if c.m3u_account_id != acct]
     if prefer and prefer != "off" and same:
-        same = _quality_ranked(same, prefer)
+        same = _quality_ranked(same, prefer, use_audio)
     primary = same[0] if same else chosen
     return primary, same + other
 
@@ -726,6 +833,7 @@ def _apply_preferences(content_obj, relation, candidates,
     cfg = _load_config()
     remember = cfg["remember_ui_picks"]
     prefer = cfg["prefer_quality"]
+    use_audio = cfg["prefer_audio"]
 
     # 1. Explicit request pick: the caller asked for a specific stream OR a
     #    specific account and the original honoured it. The movie UI sends
@@ -745,17 +853,20 @@ def _apply_preferences(content_obj, relation, candidates,
         chosen = _lookup_saved(content_obj, candidates, cfg["saved_picks"])
         if chosen is not None:
             if _is_episode(content_obj):
-                primary, ordered = _finalize_show_pick(chosen, candidates, prefer)
+                primary, ordered = _finalize_show_pick(chosen, candidates, prefer, use_audio)
             else:
                 primary, ordered = chosen, _front(candidates, chosen)
             return primary, ordered, "saved-pick"
 
-    # 3. Quality rule.
+    # 3. Quality rule. Audio (when enabled) breaks ties within a video tier, and
+    #    can also decide when there's no video signal at all but an audio one is
+    #    present -- otherwise a no-signal result falls through to native.
     if prefer and prefer != "off":
         priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"])
-        ranked = _quality_ranked(candidates, prefer)
-        if ranked and quality_rank(ranked[0], priority) > 0:
-            return ranked[0], ranked, "quality:%s" % prefer
+        ranked = _quality_ranked(candidates, prefer, use_audio)
+        top = ranked[0] if ranked else None
+        if top is not None and (quality_rank(top, priority) > 0 or (use_audio and audio_rank(top) > 0)):
+            return top, ranked, "quality:%s" % prefer
         return relation, candidates, "quality:%s:no-signal" % prefer
 
     # 4. Native.
@@ -794,11 +905,12 @@ def patched_get_content_and_relation(content_type, content_id,
         if reason != "native":
             changed = new_relation.id != relation.id
             logger.debug(
-                "[VOD-PREF] %s %s: %s -> account %s stream %s (tier=%s, changed=%s, "
-                "candidates=%d)",
+                "[VOD-PREF] %s %s: %s -> account %s stream %s (tier=%s, audio=%s, "
+                "changed=%s, candidates=%d)",
                 content_type, _log_label(content_obj, new_relation), reason,
                 new_relation.m3u_account_id, new_relation.stream_id,
-                quality_tier(new_relation), changed, len(new_candidates),
+                quality_tier(new_relation), _audio_label(new_relation),
+                changed, len(new_candidates),
             )
         return content_obj, new_relation, new_candidates
     except Exception as exc:
