@@ -254,6 +254,19 @@ def AUD(codec, channels=None, layout=None):
     return d
 
 
+def DV(width=3840, height=2160, compat=0, profile=5):
+    """Build a video dict carrying a Dolby Vision DOVI configuration record."""
+    rec = {"side_data_type": "DOVI configuration record", "dv_profile": profile}
+    if compat is not None:
+        rec["dv_bl_signal_compatibility_id"] = compat
+    return {"width": width, "height": height, "side_data_list": [rec]}
+
+
+def VID(width, height):
+    """Build a plain (non-DV) video dict of the given dimensions."""
+    return {"width": width, "height": height}
+
+
 # --------------------------------------------------------------------------- #
 # Native stub for _get_content_and_relation
 # --------------------------------------------------------------------------- #
@@ -598,6 +611,76 @@ def test_audio_decides_when_no_video_signal():
     check("no video signal + audio off -> native", rel.id == r_stereo.id)
 
 
+def test_dv_no_fallback_detection():
+    print("test_dv_no_fallback_detection")
+    d = lambda **kw: patch._is_dv_no_fallback(FakeRelation(1, 1, "a", **kw))
+    check("DOVI compat=0 -> no fallback", d(video=DV(compat=0)) is True)
+    check("DOVI compat=1 (HDR10 base) -> ok", d(video=DV(compat=1, profile=8)) is False)
+    check("DOVI compat=2 (SDR base) -> ok", d(video=DV(compat=2, profile=8)) is False)
+    check("DOVI compat=4 (HLG base) -> ok", d(video=DV(compat=4, profile=8)) is False)
+    check("DOVI profile 5, compat missing -> no fallback",
+          d(video=DV(compat=None, profile=5)) is True)
+    check("plain 4K (no DOVI) -> not flagged", d(video=VID(3840, 2160)) is False)
+    check("no video info -> not flagged", patch._is_dv_no_fallback(FakeRelation(1, 1, "a")) is False)
+
+
+def test_avoid_dv_prefers_compatible():
+    print("test_avoid_dv_prefers_compatible")
+    dv = FakeRelation(1, 1, "dv", video=DV(compat=0))          # DV-P5 4K, top priority
+    ok4k = FakeRelation(2, 2, "ok4k", video=VID(3840, 2160))   # compatible 4K
+    ok1080 = FakeRelation(3, 2, "ok1080", video=VID(1920, 1080))  # compatible 1080p
+
+    # avoid on + prefer 4k: a compatible 4K beats the no-fallback DV 4K.
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False, "avoid_dv_no_fallback": True})
+    scenario(FakeMovie(tmdb_id="1"), [dv, ok4k])  # native: DV first
+    _, rel, cands = call()
+    check("compatible 4K chosen over no-fallback DV 4K", rel.id == ok4k.id)
+    check("no-fallback DV demoted to last", [c.id for c in cands] == [ok4k.id, dv.id])
+
+    # Only a compatible 1080p available: still beats the DV-P5 4K (compat is top key).
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False, "avoid_dv_no_fallback": True})
+    scenario(FakeMovie(tmdb_id="1"), [dv, ok1080])
+    _, rel, _ = call()
+    check("compatible 1080p beats no-fallback DV 4K", rel.id == ok1080.id)
+
+    # DV-P5 is the ONLY option: still served (never excluded).
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False, "avoid_dv_no_fallback": True})
+    scenario(FakeMovie(tmdb_id="1"), [dv])
+    _, rel, _ = call()
+    check("no-fallback DV served when it's the only candidate", rel.id == dv.id)
+
+
+def test_avoid_dv_off_keeps_dv():
+    print("test_avoid_dv_off_keeps_dv")
+    # Default off: prefer 4k still picks the DV-P5 4K (highest tier), unchanged.
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False, "avoid_dv_no_fallback": False})
+    dv = FakeRelation(1, 1, "dv", video=DV(compat=0))
+    ok1080 = FakeRelation(2, 2, "ok1080", video=VID(1920, 1080))
+    scenario(FakeMovie(tmdb_id="1"), [dv, ok1080])
+    _, rel, _ = call()
+    check("avoid off -> DV-P5 4K still chosen by prefer 4k", rel.id == dv.id)
+
+
+def test_avoid_dv_with_quality_off():
+    print("test_avoid_dv_with_quality_off")
+    dv = FakeRelation(1, 1, "dv", video=DV(compat=0))
+    ok = FakeRelation(2, 2, "ok", video=VID(1920, 1080))
+
+    # prefer off, avoid on: demote the DV-P5 native primary to a compatible one.
+    reset(fields={"prefer_quality": "off", "remember_ui_picks": False, "avoid_dv_no_fallback": True})
+    scenario(FakeMovie(tmdb_id="1"), [dv, ok])  # native primary = DV-P5
+    _, rel, cands = call()
+    check("prefer off + avoid on: compatible chosen over native DV-P5", rel.id == ok.id)
+    check("DV-P5 moved last", [c.id for c in cands] == [ok.id, dv.id])
+
+    # prefer off, avoid on, native primary already compatible -> native (no reshuffle).
+    reset(fields={"prefer_quality": "off", "remember_ui_picks": False, "avoid_dv_no_fallback": True})
+    scenario(FakeMovie(tmdb_id="1"), [ok, dv])
+    _, rel, cands = call()
+    check("primary already compatible -> unchanged", rel.id == ok.id)
+    check("native order kept", [c.id for c in cands] == [ok.id, dv.id])
+
+
 def test_quality_stable_for_unknowns():
     print("test_quality_stable_for_unknowns")
     reset(fields={"prefer_quality": "4k", "remember_ui_picks": False})
@@ -901,6 +984,10 @@ if __name__ == "__main__":
     test_audio_rank()
     test_audio_tiebreak_within_tier()
     test_audio_decides_when_no_video_signal()
+    test_dv_no_fallback_detection()
+    test_avoid_dv_prefers_compatible()
+    test_avoid_dv_off_keeps_dv()
+    test_avoid_dv_with_quality_off()
     test_quality_stable_for_unknowns()
     test_capture_and_persist_once()
     test_episode_capture_is_show_level()

@@ -54,7 +54,7 @@ def _format_picks(picks):
 
 class Plugin:
     name = "Dispatcharr VOD Preferences"
-    version = "1.2.0"
+    version = "1.3.0"
     description = (
         "Greater control over which VOD stream Dispatcharr serves through its "
         "proxy for a given title (control not exposed to clients): prefer a "
@@ -126,6 +126,25 @@ class Plugin:
                 "streams with no readable audio info keep their native order. "
                 "Depends on per-stream audio metadata (codec/channels), populated "
                 "by an advanced/detailed refresh -- dormant where it's absent."
+            ),
+        },
+        {
+            "id": "avoid_dv_no_fallback",
+            "label": "Avoid Dolby Vision without HDR/SDR fallback",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "Some Dolby Vision streams (Profile 5) carry no HDR10/SDR base "
+                "layer, so they render with a green/purple cast on players that "
+                "can't decode DV. Turn this on to demote such streams BELOW every "
+                "compatible stream, so the proxy serves a playable copy instead -- "
+                "a compatible 4K when another provider has one, otherwise the best "
+                "compatible lower-resolution copy. A no-fallback DV stream is only "
+                "ever served when it's the sole option (fall back to a manual UI "
+                "pick there). Only streams positively tagged as DV-without-fallback "
+                "are affected; everything else is untouched. Leave off if your "
+                "players handle Profile 5 fine. Depends on per-stream probe "
+                "metadata (populated by an advanced/detailed refresh)."
             ),
         },
         {
@@ -219,6 +238,7 @@ class Plugin:
                     f"prefer_quality={settings.get('prefer_quality', 'off')}, "
                     f"remember_ui_picks={settings.get('remember_ui_picks', True)}, "
                     f"prefer_audio={settings.get('prefer_audio', False)}, "
+                    f"avoid_dv_no_fallback={settings.get('avoid_dv_no_fallback', False)}, "
                     f"saved_picks={len(_patch.get_saved_picks())}"
                 ),
             }

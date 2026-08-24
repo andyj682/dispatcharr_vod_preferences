@@ -80,6 +80,14 @@ Plugins page → **Dispatcharr VOD Preferences** → **Settings** tab:
   native order. Reads per-stream
   codec/channels from the probe data (populated by an advanced/detailed refresh),
   so it's dormant where that metadata is absent.
+- **Avoid Dolby Vision without HDR/SDR fallback** — on/off (default **off**). Some
+  Dolby Vision streams (Profile 5) carry no HDR10/SDR base layer and show a
+  green/purple cast on players that can't decode DV. When on, such streams are
+  demoted *below every compatible stream*, so the proxy serves a playable copy —
+  a compatible 4K if another provider has one, otherwise the best compatible
+  lower-resolution copy; a no-fallback DV stream is served only when it's the sole
+  option (fall back to a manual pick there). Only positively-tagged streams are
+  affected. Leave off if your players handle Profile 5 fine.
 - **Title key to clear** — a text box used only by the **Clear one** action below.
 
 **Actions** tab:
@@ -103,7 +111,7 @@ most-specific-first:
 |---|------|---------------|
 | 1 | **Explicit request pick** | The request named a specific stream (`stream_id`, movie UI play) or provider (`m3u_account_id`, series/episode UI play). Passed through untouched; if *Remember my UI pick* is on, it's saved as this title's default. |
 | 2 | **Saved UI pick** | A remembered pick for this title. **Movies** pin the exact `(provider, stream)`. **TV pins the provider for the whole series** and still applies the quality rule *within* that provider (so Prefer 4K picks the 4K copy when one provider carries both). Dropped automatically if the provider no longer carries the title. |
-| 3 | **Quality rule** | *Prefer quality* is set. Candidates are stable-sorted by quality; the best becomes primary and failover follows quality order. With *Prefer better audio* on, audio format is a secondary key that breaks ties among streams of the same video tier (surround-first, then lossless > Dolby > AAC). |
+| 3 | **Quality rule / DV-avoidance** | *Prefer quality* is set and/or *Avoid DV without fallback* is on. Candidates are stable-sorted by a composite key: DV-without-fallback demotion (top, when enabled) → video quality → audio (when *Prefer better audio* is on). The best becomes primary and failover follows that order. |
 | 4 | **Native** | None of the above — untouched account priority. |
 
 Streams with no quality signal keep their native account-priority order (the sort

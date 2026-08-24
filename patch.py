@@ -35,7 +35,10 @@ most-specific-first ladder:
      signal keep their native account-priority order (stable tiebreak). When
      "prefer audio" is also on, audio rank (surround-first, then lossless >
      Dolby > AAC > other) is a SECONDARY key that breaks ties among streams of
-     the same video tier.
+     the same video tier. When "avoid DV without fallback" is on, a Dolby-Vision
+     stream with no HDR10/SDR/HLG base layer is demoted below every compatible
+     stream (the TOP key) so a playable copy wins; it's only served if nothing
+     else is available.
   4. Native -- account priority, untouched.
 
 Composition: this plugin only reads/re-orders the relation list. It never
@@ -115,6 +118,7 @@ MAX_SAVED_PICKS = 10000
 DEFAULT_PREFER_QUALITY = "off"
 DEFAULT_REMEMBER_UI_PICKS = True
 DEFAULT_PREFER_AUDIO = False
+DEFAULT_AVOID_DV_NO_FALLBACK = False
 
 # Quality-token patterns, checked most-specific-first so "UHD"/"FHD" resolve
 # before the plain "HD" of the 720p tier. Each token must be bounded by a
@@ -483,6 +487,53 @@ def _audio_label(relation):
 
 
 # --------------------------------------------------------------------------- #
+# Dolby Vision without a fallback layer
+# --------------------------------------------------------------------------- #
+
+def _iter_video_dicts(relation):
+    """Yield the ffprobe-style 'video' dicts from the same per-stream detail
+    locations the quality-tier waterfall reads (movies: 'detailed_info';
+    episodes: 'info'.'info')."""
+    cp = _custom_props(relation)
+    detailed_info = cp.get("detailed_info") if isinstance(cp.get("detailed_info"), dict) else None
+    info = cp.get("info") if isinstance(cp.get("info"), dict) else None
+    basic_data = cp.get("basic_data") if isinstance(cp.get("basic_data"), dict) else None
+    dicts = [d for d in (detailed_info, info, basic_data) if d]
+    if info is not None and isinstance(info.get("info"), dict):
+        dicts.append(info["info"])
+    for d in dicts:
+        v = d.get("video")
+        if isinstance(v, dict):
+            yield v
+
+
+def _is_dv_no_fallback(relation) -> bool:
+    """True when a stream is Dolby Vision WITHOUT an HDR10/SDR/HLG fallback layer
+    -- i.e. it won't render correctly on non-DV devices (green/purple cast).
+
+    The signal is a ffprobe 'DOVI configuration record' in the video track's
+    side_data_list whose base-layer signal is compatible with nothing:
+    dv_bl_signal_compatibility_id == 0 (Profile 5). Profiles 8.1/8.4/8.2 carry a
+    HDR10/HLG/SDR base layer (compat 1/4/2) and are NOT flagged. Detection is
+    positive-only: a stream with no DOVI record is never flagged, so untagged
+    streams keep their native treatment.
+    """
+    for v in _iter_video_dicts(relation):
+        for sd in (v.get("side_data_list") or []):
+            if not isinstance(sd, dict):
+                continue
+            if "DOVI" not in str(sd.get("side_data_type") or ""):
+                continue
+            compat = sd.get("dv_bl_signal_compatibility_id")
+            if compat == 0:
+                return True
+            # A Profile 5 record with a missing compat field is still no-fallback.
+            if compat is None and sd.get("dv_profile") == 5:
+                return True
+    return False
+
+
+# --------------------------------------------------------------------------- #
 # Title keys
 # --------------------------------------------------------------------------- #
 
@@ -680,6 +731,10 @@ def _load_config(force: bool = False) -> dict:
             settings.get("prefer_audio", DEFAULT_PREFER_AUDIO),
             DEFAULT_PREFER_AUDIO,
         ),
+        "avoid_dv_no_fallback": _as_bool(
+            settings.get("avoid_dv_no_fallback", DEFAULT_AVOID_DV_NO_FALLBACK),
+            DEFAULT_AVOID_DV_NO_FALLBACK,
+        ),
         "saved_picks": picks if isinstance(picks, dict) else {},
     }
     with _cfg_lock:
@@ -810,32 +865,43 @@ def _log_label(content_obj, relation):
     return f"as:{relation.m3u_account_id}:{relation.stream_id}"
 
 
-def _quality_ranked(candidates, prefer, use_audio=False):
-    """Stable-sort candidates by the prefer_quality ladder (best first).
+def _quality_ranked(candidates, prefer, use_audio=False, avoid_dv=False):
+    """Stable-sort candidates (best first) by a composite key.
 
-    When *use_audio* is set, audio rank is a SECONDARY key: it breaks ties only
-    among streams of the same video tier (video quality still dominates). The
-    sort stays stable, so streams equal on both keys keep native order.
+    Key = (compatible, quality_rank, audio_rank), all higher-is-better:
+      * compatible -- when *avoid_dv* is on, a Dolby-Vision-without-fallback
+        stream scores 0 and everything else 1, so a PLAYABLE stream outranks a
+        no-fallback DV stream even of higher resolution. Off -> all 1 (no effect).
+      * quality_rank -- the prefer_quality ladder (0 when prefer is off/unset).
+      * audio_rank -- SECONDARY tiebreak within a video tier, only when
+        *use_audio* and a quality preference are both active.
+    The sort is stable, so streams equal on every active key keep native order.
     """
-    priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"])
+    quality_on = bool(prefer) and prefer != "off"
+    priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"]) if quality_on else None
     return sorted(
         candidates,
-        key=lambda c: (quality_rank(c, priority), audio_rank(c) if use_audio else 0),
+        key=lambda c: (
+            0 if (avoid_dv and _is_dv_no_fallback(c)) else 1,
+            quality_rank(c, priority) if priority else 0,
+            audio_rank(c) if (quality_on and use_audio) else 0,
+        ),
         reverse=True,
     )
 
 
-def _finalize_show_pick(chosen, candidates, prefer, use_audio=False):
+def _finalize_show_pick(chosen, candidates, prefer, use_audio=False, avoid_dv=False):
     """A TV show pick names a PROVIDER (account). Keep that provider, but still
-    honour the quality rule WITHIN it -- so when one provider carries both the 4K
-    and non-4K copy of an episode, Prefer 4K picks the 4K stream. Fail over to
-    other providers (native order) only if the chosen provider can't serve it.
+    honour the quality rule and DV-avoidance WITHIN it -- so when one provider
+    carries both the 4K and non-4K copy of an episode, Prefer 4K picks the 4K
+    stream, and a compatible copy is preferred over a no-fallback DV one. Fail
+    over to other providers (native order) only if the chosen provider can't serve it.
     """
     acct = chosen.m3u_account_id
     same = [c for c in candidates if c.m3u_account_id == acct]
     other = [c for c in candidates if c.m3u_account_id != acct]
-    if prefer and prefer != "off" and same:
-        same = _quality_ranked(same, prefer, use_audio)
+    if same and ((prefer and prefer != "off") or avoid_dv):
+        same = _quality_ranked(same, prefer, use_audio, avoid_dv)
     primary = same[0] if same else chosen
     return primary, same + other
 
@@ -847,6 +913,7 @@ def _apply_preferences(content_obj, relation, candidates,
     remember = cfg["remember_ui_picks"]
     prefer = cfg["prefer_quality"]
     use_audio = cfg["prefer_audio"]
+    avoid_dv = cfg["avoid_dv_no_fallback"]
 
     # 1. Explicit request pick: the caller asked for a specific stream OR a
     #    specific account and the original honoured it. The movie UI sends
@@ -866,21 +933,32 @@ def _apply_preferences(content_obj, relation, candidates,
         chosen = _lookup_saved(content_obj, candidates, cfg["saved_picks"])
         if chosen is not None:
             if _is_episode(content_obj):
-                primary, ordered = _finalize_show_pick(chosen, candidates, prefer, use_audio)
+                primary, ordered = _finalize_show_pick(chosen, candidates, prefer, use_audio, avoid_dv)
             else:
                 primary, ordered = chosen, _front(candidates, chosen)
             return primary, ordered, "saved-pick"
 
-    # 3. Quality rule. Audio (when enabled) breaks ties within a video tier, and
-    #    can also decide when there's no video signal at all but an audio one is
-    #    present -- otherwise a no-signal result falls through to native.
-    if prefer and prefer != "off":
-        priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"])
-        ranked = _quality_ranked(candidates, prefer, use_audio)
+    # 3. Quality rule and/or Dolby-Vision avoidance. Both re-order candidates;
+    #    DV-avoidance (when on) is the TOP sort key, so a playable stream beats a
+    #    no-fallback DV one even at higher resolution, while the quality rule and
+    #    audio tiebreak order the rest. Audio can also decide when there's no
+    #    video signal but an audio one is present; otherwise a no-signal quality
+    #    result (and a DV-avoidance that changed nothing) falls through to native.
+    quality_on = bool(prefer) and prefer != "off"
+    if quality_on or avoid_dv:
+        priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"]) if quality_on else None
+        ranked = _quality_ranked(candidates, prefer, use_audio, avoid_dv)
         top = ranked[0] if ranked else None
-        if top is not None and (quality_rank(top, priority) > 0 or (use_audio and audio_rank(top) > 0)):
-            return top, ranked, "quality:%s" % prefer
-        return relation, candidates, "quality:%s:no-signal" % prefer
+        if top is not None:
+            has_quality = quality_on and quality_rank(top, priority) > 0
+            has_audio = quality_on and use_audio and audio_rank(top) > 0
+            avoided = avoid_dv and _is_dv_no_fallback(relation) and not _is_dv_no_fallback(top)
+            if has_quality or has_audio:
+                return top, ranked, "quality:%s" % prefer
+            if avoided:
+                return top, ranked, "avoid-dv"
+        if quality_on:
+            return relation, candidates, "quality:%s:no-signal" % prefer
 
     # 4. Native.
     return relation, candidates, "native"
@@ -919,11 +997,11 @@ def patched_get_content_and_relation(content_type, content_id,
             changed = new_relation.id != relation.id
             logger.debug(
                 "[VOD-PREF] %s %s: %s -> account %s stream %s (tier=%s, audio=%s, "
-                "changed=%s, candidates=%d)",
+                "dv_nofallback=%s, changed=%s, candidates=%d)",
                 content_type, _log_label(content_obj, new_relation), reason,
                 new_relation.m3u_account_id, new_relation.stream_id,
                 quality_tier(new_relation), _audio_label(new_relation),
-                changed, len(new_candidates),
+                _is_dv_no_fallback(new_relation), changed, len(new_candidates),
             )
         return content_obj, new_relation, new_candidates
     except Exception as exc:

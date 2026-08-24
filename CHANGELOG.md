@@ -5,6 +5,31 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-08-11
+
+### Added
+
+- **Avoid Dolby Vision without HDR/SDR fallback** — a new opt-in setting (default
+  off). Some Dolby Vision streams (Profile 5) carry no HDR10/SDR base layer and
+  render with a green/purple cast on players that can't decode DV. When enabled,
+  such streams are demoted **below every compatible stream** (the top sort key),
+  so the proxy serves a playable copy instead — a compatible 4K when another
+  provider has one, otherwise the best compatible lower-resolution copy. A
+  no-fallback DV stream is only ever served when it's the sole option (fall back
+  to a manual UI pick there). Detection is positive-only — a stream is flagged
+  only when its probe carries a Dolby Vision configuration record with no
+  base-layer compatibility (`dv_bl_signal_compatibility_id == 0`, i.e. Profile 5),
+  so untagged streams are never touched.
+- The per-selection DEBUG log line now includes `dv_nofallback=<bool>` for the
+  chosen stream, and **Check status** reports `avoid_dv_no_fallback`.
+
+### Notes
+
+- Composes with Prefer 4K and the audio tiebreak (avoidance is the top key,
+  resolution next, audio last) and also works with quality set to Off (a pure
+  safety demotion). Depends on the same probe metadata as the video/audio signals
+  — populated by an advanced/detailed refresh — so it's dormant where absent.
+
 ## [1.2.0] - 2026-08-11
 
 ### Added
@@ -91,6 +116,7 @@ Initial release.
   so the plugin can only choose among the streams Dispatcharr currently knows
   about; refresh a series to surface newly-added streams. Movies are unaffected.
 
+[1.3.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.0
 [1.2.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.2.0
 [1.1.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.1.0
 [1.0.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.0.0
