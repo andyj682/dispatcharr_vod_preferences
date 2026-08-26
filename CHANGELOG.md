@@ -5,6 +5,25 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-08-11
+
+Cosmetic / UI polish only — no behavior change.
+
+### Changed
+
+- Shortened the plugin's display name in the Dispatcharr UI to **VOD Preferences**
+  ("Dispatcharr" was redundant inside the Dispatcharr plugin list). The repo,
+  folder name, and config key are unchanged, so settings and saved picks are
+  unaffected.
+- Streamlined the settings help text to the gist; fuller detail now lives in the
+  README.
+
+### Fixed
+
+- The **Clear one** button on the Actions tab no longer wraps onto its own line —
+  its description was shortened so the button stays right-aligned like the other
+  actions.
+
 ## [1.3.0] - 2026-08-11
 
 ### Added
@@ -116,6 +135,7 @@ Initial release.
   so the plugin can only choose among the streams Dispatcharr currently knows
   about; refresh a series to surface newly-added streams. Movies are unaffected.
 
+[1.3.1]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.1
 [1.3.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.0
 [1.2.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.2.0
 [1.1.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.1.0
