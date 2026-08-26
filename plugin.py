@@ -57,9 +57,9 @@ class Plugin:
     version = "1.3.0"
     description = (
         "Greater control over which VOD stream Dispatcharr serves through its "
-        "proxy for a given title (control not exposed to clients): prefer a "
-        "quality tier (e.g. 4K) across providers, and/or remember the stream you "
-        "pick in the UI as that title's durable default."
+        "proxy for a given title: prefer higher video/audio qualities across "
+        "providers, and/or remember a stream selected in the UI as that title's "
+        "durable default."
     )
     author = "andyj682"
     help_url = ""
@@ -71,19 +71,12 @@ class Plugin:
             "type": "select",
             "default": "off",
             "help_text": (
-                "Re-order a title's provider streams by quality before serving. "
-                "Quality is inferred per stream from, in order: actual video pixel "
-                "dimensions (ground truth, when known), then explicit "
-                "quality/resolution, the provider stream name, and the M3U account "
-                "name -- so a '... 4K' provider, or a stream/title containing "
-                "'4K'/'2160p', is recognised, while a genuinely 1080p stream "
-                "mislabeled '4K' still ranks as 1080p. A chosen tier wins when "
-                "available; otherwise lower tiers are tried before higher ones, so "
-                "'Prefer 1080p'/'Prefer 720p' won't pull a huge 4K stream. Streams "
-                "with no quality signal keep their native account-priority order. "
-                "Note: on many providers sub-4K streams carry no resolution label, "
-                "so 1080p/720p only take effect once real video dimensions are known "
-                "(after an advanced/detailed refresh) or the provider labels the tier."
+                "Sets the highest video quality to prefer. Quality is inferred from "
+                "actual video pixel dimensions, explicit quality/resolution, provider "
+                "stream name, and M3U account name (e.g., a '4K' provider), in that "
+                "order. A chosen tier wins when available; otherwise lower priorities "
+                "are tried before higher ones in descending order. Streams with no "
+                "quality signal keep their native account-priority order."
             ),
             # The full tier ladder lives in patch.py (_QUALITY_PRIORITY). 1080p/720p
             # depend on a resolution signal being present (real dims or a labelled
@@ -102,11 +95,9 @@ class Plugin:
             "type": "boolean",
             "default": True,
             "help_text": (
-                "When you play a specific stream from the Dispatcharr UI, save it "
-                "as the default so the proxy serves it next time. Movies "
-                "remember the exact stream; TV remembers the PROVIDER for the whole "
-                "series (picking a stream on one episode makes that provider the "
-                "default for every episode of the show). Applied ahead of the "
+                "Save a specific stream played from the Dispatcharr UI as the default "
+                "so the proxy serves it next time. Movies remember the exact stream; "
+                "TV remembers the PROVIDER for the whole series. Applied ahead of the "
                 "quality rule; dropped automatically if the provider stops carrying "
                 "the title."
             ),
@@ -117,15 +108,10 @@ class Plugin:
             "type": "boolean",
             "default": False,
             "help_text": (
-                "Break ties by audio format AMONG streams of the same video "
-                "quality. Only takes effect when 'Prefer quality' is set (it never "
-                "overrides video quality -- a higher-resolution stream always wins). "
-                "Order is surround-first, then lossless over Dolby over AAC: 5.1/7.1 "
-                "lossless (TrueHD/DTS) > 5.1/7.1 Dolby (AC3/EAC3) > 5.1/7.1 AAC > "
-                "5.1/7.1 other > 2.0 lossless > 2.0 Dolby > 2.0 AAC > 2.0 other; "
-                "streams with no readable audio info keep their native order. "
-                "Depends on per-stream audio metadata (codec/channels), populated "
-                "by an advanced/detailed refresh -- dormant where it's absent."
+                "Among streams of the same video quality, prefer higher-quality "
+                "audio (5.1/7.1 -> 2.0, and within each category lossless -> Dolby "
+                "-> AAC -> other). Streams with no readable audio info keep their "
+                "native order."
             ),
         },
         {
@@ -134,17 +120,9 @@ class Plugin:
             "type": "boolean",
             "default": False,
             "help_text": (
-                "Some Dolby Vision streams (Profile 5) carry no HDR10/SDR base "
-                "layer, so they render with a green/purple cast on players that "
-                "can't decode DV. Turn this on to demote such streams BELOW every "
-                "compatible stream, so the proxy serves a playable copy instead -- "
-                "a compatible 4K when another provider has one, otherwise the best "
-                "compatible lower-resolution copy. A no-fallback DV stream is only "
-                "ever served when it's the sole option (fall back to a manual UI "
-                "pick there). Only streams positively tagged as DV-without-fallback "
-                "are affected; everything else is untouched. Leave off if your "
-                "players handle Profile 5 fine. Depends on per-stream probe "
-                "metadata (populated by an advanced/detailed refresh)."
+                "Demote Dolby Vision streams with no HDR10/SDR base layer (Profile 5) "
+                "to lowest priority to avoid playback compatibility issues. Leave off "
+                "if your players handle Profile 5 fine."
             ),
         },
         {

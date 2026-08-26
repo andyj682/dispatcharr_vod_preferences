@@ -2,19 +2,31 @@
 
 Plugin for Dispatcharr that provides greater control over **which VOD stream** it
 serves through its proxy for a given title — control not currently exposed to
-clients. It adds two independent, composable features:
+clients. It adds several independent, composable controls:
 
-1. **Prefer 4K** — re-order a title's provider streams by quality before serving,
-   so the 4K copy wins even if a lower-quality provider has higher account
-   priority. Stream quality is determined by measured video resolution, then the
-   stream name, then the provider name, in that order of priority.
-2. **Remember my UI pick** — when you play a specific stream from the Dispatcharr
+1. **Prefer a video quality tier** — re-order a title's provider streams by quality
+   before serving, so your preferred tier wins even if a lower-quality provider has
+   higher account priority. Choose **4K**, **1080p**, or **720p**; when the exact
+   tier isn't available the plugin steps *down* to lower tiers before *up* to
+   higher ones, so `Prefer 1080p`/`Prefer 720p` never pull a large 4K file. Quality
+   is inferred per stream from measured video dimensions, then explicit
+   quality/resolution, then the provider stream name, then the account name.
+2. **Prefer better audio** *(optional tiebreaker)* — among streams of the **same**
+   video quality, prefer higher-quality audio: surround before stereo, and within
+   each, lossless (TrueHD/DTS) → Dolby (AC3/EAC3) → AAC → other. It's a tiebreaker
+   only — it never overrides the video-quality choice.
+3. **Remember my UI pick** — when you play a specific stream from the Dispatcharr
    UI, save it as that title's default so the proxy serves the same choice next
    time. Useful when the default stream for a title is broken in some non-obvious
    way. Movie choices are saved at the **stream** level; series choices are saved
-   at the **provider** level (with finer control available via "Prefer 4K" where
-   needed — see below for Dispatcharr's inherent limitations on remembering
+   at the **provider** level (with quality chosen within that provider by the rules
+   above — see below for Dispatcharr's inherent limitations on remembering
    stream-level picks for series).
+4. **Avoid Dolby Vision without HDR/SDR fallback** *(optional)* — demote Dolby
+   Vision Profile 5 streams, which carry no HDR10/SDR base layer and render with a
+   green/purple cast on players that can't decode DV, below every compatible
+   stream — so a playable copy is served instead (a compatible 4K when another
+   provider has one, otherwise the best compatible lower-resolution copy).
 
 You still get Dispatcharr's provider slot management and failover; this plugin
 only re-orders the candidate list Dispatcharr already built. It works with a
