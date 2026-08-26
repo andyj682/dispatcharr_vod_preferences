@@ -53,7 +53,7 @@ def _format_picks(picks):
 
 
 class Plugin:
-    name = "Dispatcharr VOD Preferences"
+    name = "VOD Preferences"
     version = "1.3.0"
     description = (
         "Greater control over which VOD stream Dispatcharr serves through its "

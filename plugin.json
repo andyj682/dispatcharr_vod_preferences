@@ -1,5 +1,5 @@
 {
-  "name": "Dispatcharr VOD Preferences",
+  "name": "VOD Preferences",
   "version": "1.3.0",
   "description": "Greater control over which VOD stream Dispatcharr serves through its proxy for a given title: prefer higher video/audio qualities across providers, and/or remember a stream selected in the UI as that title's durable default.",
   "author": "andyj682",

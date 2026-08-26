@@ -71,7 +71,7 @@ enable request; a restart patches all of them.
 
 ## Configure
 
-Plugins page → **Dispatcharr VOD Preferences** → **Settings** tab:
+Plugins page → **VOD Preferences** → **Settings** tab:
 
 - **Prefer quality** — `Off` / `Prefer 4K` / `Prefer 1080p` / `Prefer 720p`.
   Default `Off`. A chosen tier wins when available; otherwise the plugin steps
