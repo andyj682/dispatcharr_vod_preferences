@@ -54,7 +54,7 @@ def _format_picks(picks):
 
 class Plugin:
     name = "VOD Preferences"
-    version = "1.3.1"
+    version = "1.3.2"
     description = (
         "Greater control over which VOD stream Dispatcharr serves through its "
         "proxy for a given title: prefer higher video/audio qualities across "
@@ -62,7 +62,7 @@ class Plugin:
         "durable default."
     )
     author = "andyj682"
-    help_url = ""
+    help_url = "https://github.com/andyj682/dispatcharr_vod_preferences"
 
     fields = [
         {
@@ -171,14 +171,14 @@ class Plugin:
             "description": "Remove the saved pick whose key is in the "
                            "'Title key to clear' box (Settings tab).",
             "button_label": "Clear one",
-            "button_variant": "outline",
+            "button_variant": "filled",
         },
         {
             "id": "clear_saved",
             "label": "Clear all saved picks",
             "description": "Remove every remembered per-title stream pick.",
             "button_label": "Clear all",
-            "button_variant": "default",
+            "button_variant": "light",
             "button_color": "red",
             "confirm": {
                 "title": "Clear all saved picks?",

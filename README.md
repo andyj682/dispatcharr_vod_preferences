@@ -208,15 +208,29 @@ docker logs -f <dispatcharr-container> 2>&1 | grep "VOD-PREF"
 A decision line reads:
 
 ```
-[VOD-PREF] episode tmdb:12345: quality:4k -> account 7 stream 1978843 (tier=4k, changed=True, candidates=5)
+[VOD-PREF] episode tmdb:12345: quality:4k -> account 7 stream 1978843 (tier=4k, audio=eac3/6ch, dv_nofallback=False, changed=True, candidates=5)
 ```
 
 - `reason` — which rung fired: `request-pick`, `saved-pick`, `quality:4k`,
-  `quality:4k:no-signal`, or nothing logged = `native`.
+  `quality:4k:no-signal`, `avoid-dv`, or nothing logged = `native`.
+- `tier` / `audio` / `dv_nofallback` — the chosen stream's video tier, audio
+  (codec/channels), and whether it's Dolby Vision without an HDR/SDR fallback.
 - `changed=True` — the plugin moved off the native primary (it did real work);
   `changed=False` — its choice already matched native (still confirmation it ran).
 - `candidates=N` — how many streams the title has right now (see the episode
   staleness note below if this looks low).
+
+### See the plugin's ranking without DEBUG (dry-run)
+
+[`tools/rank_dryrun.sh`](tools/rank_dryrun.sh) prints the plugin's **deterministic**
+ranking and decision for any episode straight from the current database — no
+log-level change needed. It loads the installed `patch.py` and runs the real
+ranking logic, showing the native candidate order, the plugin's pick (and why),
+and the pure ranking with `avoid_dv` off/on. Edit the `-e` variables at the top
+(an episode ID, or series name + season + episode) and run it on the Dispatcharr
+host. Especially handy when playback differs from what you expect: if the
+dry-run's pick and the served stream disagree, the difference is Dispatcharr-side
+(a provider at capacity, or an idle session being reused), not the plugin's logic.
 
 ### Test Prefer 4K (the definitive A/B)
 

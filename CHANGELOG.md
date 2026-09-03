@@ -5,6 +5,23 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-08-11
+
+### Added
+
+- **Docs link** in the plugin card — `help_url` now points at the GitHub repo.
+- `tools/rank_dryrun.sh` — a diagnostic that prints the plugin's deterministic
+  ranking/decision for any episode from the current database, without changing log
+  levels (loads the installed `patch.py` and runs its real ranking logic). Not
+  shipped in the plugin zip. README troubleshooting section documents it.
+
+### Changed
+
+- Actions-tab button styling for clearer intent: **Clear one** is now solid blue
+  (an action, vs the read-only outline buttons), and **Clear all** is light red to
+  signal it's destructive. (The previous `default` variant rendered neutral and
+  ignored the `red` color; `light` shows the red tint.)
+
 ## [1.3.1] - 2026-08-11
 
 Cosmetic / UI polish only — no behavior change.
@@ -135,6 +152,7 @@ Initial release.
   so the plugin can only choose among the streams Dispatcharr currently knows
   about; refresh a series to surface newly-added streams. Movies are unaffected.
 
+[1.3.2]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.2
 [1.3.1]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.1
 [1.3.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.0
 [1.2.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.2.0
