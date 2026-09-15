@@ -1,6 +1,6 @@
 {
   "name": "VOD Preferences",
-  "version": "1.3.2",
+  "version": "1.3.3",
   "description": "Greater control over which VOD stream Dispatcharr serves through its proxy for a given title: prefer higher video/audio qualities across providers, and/or remember a stream selected in the UI as that title's durable default.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_preferences",
@@ -10,7 +10,7 @@
       "label": "Prefer quality",
       "type": "select",
       "default": "off",
-      "help_text": "Sets the highest video quality to prefer. Quality is inferred from actual video pixel dimensions, explicit quality/resolution, provider stream name, and M3U account name (e.g., a '4K' provider), in that order. A chosen tier wins when available; otherwise lower priorities are tried before higher ones in descending order. Streams with no quality signal keep their native account-priority order.",
+      "help_text": "Sets the highest video quality to prefer. Quality is inferred from actual video pixel dimensions, explicit quality/resolution, provider stream name, and M3U account name (e.g., a '4K' provider), in that order. A chosen tier wins when available; otherwise lower priorities are tried before higher ones in descending order. Streams with no quality signal keep their native account-priority order. Most precise on TV, which carries measured resolution; on movies, providers commonly label only 4K, so any tier there mainly prefers a 4K-labeled copy when present and can't pick an unlabeled 1080p/720p.",
       "options": [
         { "value": "off", "label": "Off (native account priority)" },
         { "value": "4k", "label": "Prefer 4K" },

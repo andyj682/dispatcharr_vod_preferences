@@ -155,6 +155,18 @@ Matching is **word-boundary** based, so free-text names don't misfire
 > account name unless you mean it. `4K`, `1080p`, `720p`, `480p` are the safe,
 > unambiguous tokens.
 
+**Quality tiering on movies vs TV.** The waterfall above means the *precision* of
+the quality control differs by content type. TV episodes usually carry measured
+video dimensions (from the provider's per-stream probe), so every tier works
+exactly. Movies on many providers carry no per-stream dimensions and label only
+the 4K copies in the title, so their sub-4K copies read as *unknown* tier. Because
+any recognized tier — including 4K, which sits at the bottom of the 1080p/720p
+ladders — outranks an unknown one, on such movies **any active quality setting
+tends to serve the 4K-labeled copy** (and does nothing when nothing is labeled).
+To reliably prefer sub-4K on movies you'd need real per-stream dimensions (e.g. an
+ffprobe-based enrichment pass); until then, movie quality selection is effectively
+"Off or prefer-4K."
+
 **Movies vs TV — an asymmetry rooted in the UI.** A movie play sends the exact
 `stream_id`, so movie picks pin the exact stream. A series play sends only the
 `m3u_account_id` (the Series UI has no per-episode stream id), so TV picks are
@@ -208,7 +220,7 @@ docker logs -f <dispatcharr-container> 2>&1 | grep "VOD-PREF"
 A decision line reads:
 
 ```
-[VOD-PREF] episode tmdb:12345: quality:4k -> account 7 stream 1978843 (tier=4k, audio=eac3/6ch, dv_nofallback=False, changed=True, candidates=5)
+[VOD-PREF] episode tmdb:12345: quality:4k -> account 7 stream 900001 (tier=4k, audio=eac3/6ch, dv_nofallback=False, changed=True, candidates=5)
 ```
 
 - `reason` — which rung fired: `request-pick`, `saved-pick`, `quality:4k`,

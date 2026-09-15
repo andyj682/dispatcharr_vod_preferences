@@ -272,8 +272,16 @@ def VID(width, height):
 # --------------------------------------------------------------------------- #
 CURRENT = {"content": None, "candidates": []}
 
+# Records every call the wrapper forwards to the original -- used by the
+# signature-parity test to prove unknown args are ACCEPTED and FORWARDED, not
+# just swallowed. The *args/**kwargs mirror upstream possibly gaining a parameter
+# (positionally or as a keyword) on a future release.
+NATIVE_CALLS = []
 
-def native_stub(content_type, content_id, preferred_m3u_account_id=None, preferred_stream_id=None):
+
+def native_stub(content_type, content_id, preferred_m3u_account_id=None,
+                preferred_stream_id=None, *args, **kwargs):
+    NATIVE_CALLS.append({"args": args, "kwargs": kwargs})
     content = CURRENT["content"]
     candidates = CURRENT["candidates"]
     relation = candidates[0] if candidates else None
@@ -971,6 +979,41 @@ def test_inactive_passes_through():
     patch._ACTIVE = True
 
 
+def test_signature_parity():
+    print("test_signature_parity")
+    # A future Dispatcharr release may add a parameter to _get_content_and_relation
+    # and pass it (positionally or as a keyword). The wrapper must ACCEPT it (no
+    # TypeError while binding args -- that would precede the _ACTIVE guard/try and
+    # HTTP-500 every VOD request) AND FORWARD it to the original (else a constraint
+    # core relied on is silently dropped). This encodes no parameter list, so it
+    # survives this release and the next. Mutation-check: remove *args/**kwargs
+    # from patched_get_content_and_relation and this goes red.
+    reset(fields={"prefer_quality": "off", "remember_ui_picks": False})
+    scenario(FakeMovie(tmdb_id="1"), [FakeRelation(1, 1, "s1")])
+    sentinel_pos, sentinel_kw = object(), object()
+
+    # Active path (the main _orig call site).
+    NATIVE_CALLS.clear()
+    patch.patched_get_content_and_relation(
+        "movie", "u", None, None, sentinel_pos, future_param=sentinel_kw)
+    check("active: unknown args accepted (no TypeError)", len(NATIVE_CALLS) == 1)
+    rec = NATIVE_CALLS[-1] if NATIVE_CALLS else {"args": (), "kwargs": {}}
+    check("active: unknown positional forwarded to original", sentinel_pos in rec["args"])
+    check("active: unknown keyword forwarded to original",
+          rec["kwargs"].get("future_param") is sentinel_kw)
+
+    # Inactive early-return path (must forward there too, or disabling the feature
+    # reintroduces the crash).
+    NATIVE_CALLS.clear()
+    patch._ACTIVE = False
+    patch.patched_get_content_and_relation(
+        "movie", "u", None, None, sentinel_pos, future_param=sentinel_kw)
+    patch._ACTIVE = True
+    rec = NATIVE_CALLS[-1] if NATIVE_CALLS else {"args": (), "kwargs": {}}
+    check("inactive: unknown positional forwarded", sentinel_pos in rec["args"])
+    check("inactive: unknown keyword forwarded", rec["kwargs"].get("future_param") is sentinel_kw)
+
+
 if __name__ == "__main__":
     test_quality_helpers()
     test_cover_image_dims_ignored()
@@ -1003,6 +1046,7 @@ if __name__ == "__main__":
     test_legacy_migration()
     test_wrapper_falls_back_on_error()
     test_inactive_passes_through()
+    test_signature_parity()
     print()
     if _failures:
         print(f"{len(_failures)} check(s) FAILED: {_failures}")

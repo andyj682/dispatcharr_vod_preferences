@@ -54,7 +54,7 @@ def _format_picks(picks):
 
 class Plugin:
     name = "VOD Preferences"
-    version = "1.3.2"
+    version = "1.3.3"
     description = (
         "Greater control over which VOD stream Dispatcharr serves through its "
         "proxy for a given title: prefer higher video/audio qualities across "
@@ -76,7 +76,11 @@ class Plugin:
                 "stream name, and M3U account name (e.g., a '4K' provider), in that "
                 "order. A chosen tier wins when available; otherwise lower priorities "
                 "are tried before higher ones in descending order. Streams with no "
-                "quality signal keep their native account-priority order."
+                "quality signal keep their native account-priority order. Most "
+                "precise on TV, which carries measured resolution; on movies, "
+                "providers commonly label only 4K, so any tier there mainly prefers "
+                "a 4K-labeled copy when present and can't pick an unlabeled "
+                "1080p/720p."
             ),
             # The full tier ladder lives in patch.py (_QUALITY_PRIORITY). 1080p/720p
             # depend on a resolution signal being present (real dims or a labelled

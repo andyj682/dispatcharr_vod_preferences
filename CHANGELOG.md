@@ -5,6 +5,38 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.3] - 2026-09-15
+
+No functional change to selection logic — hardening + docs.
+
+### Changed
+
+- **Signature-agnostic hook.** The `_get_content_and_relation` wrapper now
+  forwards any extra positional/keyword arguments straight through to the
+  original at every call site. This defends against a future Dispatcharr release
+  adding a parameter to that function: a fixed signature would raise `TypeError`
+  while binding arguments — before the wrapper's fail-open guard — turning a
+  parameter addition into an HTTP 500 on every VOD request. (The wrapper only
+  reorders the candidate list core returns, so forwarding is also sufficient for
+  correctness — there's no restriction it could undo.)
+- **Logger level.** The plugin's logger now adopts the `apps` logger's effective
+  level (guarded so anything that already set a level keeps control), so its lines
+  survive if the code ever runs in a Celery prefork child (where the root logger
+  is left at WARNING). No effect on the request path it hooks today.
+
+### Docs
+
+- Clarified in the **Prefer quality** help text and README that quality tiering is
+  precise on TV (measured resolution) but, on movies, depends on name/account
+  tokens — so where providers label only 4K, any tier tends to serve the
+  4K-labeled copy and can't select an unlabeled 1080p/720p.
+
+### Tests
+
+- Added a structural signature-parity test (unknown args accepted **and**
+  forwarded, on both the active and inactive paths); `test_logic.py` now 129
+  checks.
+
 ## [1.3.2] - 2026-08-11
 
 ### Added
@@ -152,6 +184,7 @@ Initial release.
   so the plugin can only choose among the streams Dispatcharr currently knows
   about; refresh a series to surface newly-added streams. Movies are unaffected.
 
+[1.3.3]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.3
 [1.3.2]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.2
 [1.3.1]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.1
 [1.3.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.0

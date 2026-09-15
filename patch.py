@@ -84,6 +84,18 @@ import time
 
 logger = logging.getLogger("plugins.dispatcharr_vod_preferences")
 
+# Dispatcharr's LOGGING config gives apps/celery/core/root their own handler+level
+# but does NOT name "plugins.*", so this logger has no level of its own and
+# inherits root's. That's fine in uWSGI (root=INFO), but a Celery prefork child
+# has billiard reconfigure root to WARNING, which would silently discard our INFO
+# lines there while core's apps.* lines survive. Adopt the "apps" logger's
+# effective level (so DISPATCHARR_LOG_LEVEL still applies) so our records live
+# wherever core's do. Guard on NOTSET so anything that already set a level (e.g.
+# a test silencing this logger) keeps control. Preferences hooks the request path
+# (never a prefork child today), so this is a cheap guarantee, not a live fix.
+if logger.level == logging.NOTSET:
+    logger.setLevel(logging.getLogger("apps").getEffectiveLevel() or logging.INFO)
+
 # --------------------------------------------------------------------------- #
 # Constants / tunables
 # --------------------------------------------------------------------------- #
@@ -970,16 +982,37 @@ def _apply_preferences(content_obj, relation, candidates,
 
 def patched_get_content_and_relation(content_type, content_id,
                                      preferred_m3u_account_id=None,
-                                     preferred_stream_id=None):
+                                     preferred_stream_id=None, *args, **kwargs):
+    """Signature-agnostic wrapper: forward any extra positional/keyword args
+    straight through to the original at EVERY call site.
+
+    Why: a future Dispatcharr release could add a parameter to
+    `_get_content_and_relation` and pass it (possibly as a keyword). A fixed
+    signature would raise TypeError while *binding arguments* -- before the
+    `_ACTIVE` guard and before the try/except below -- and the caller wraps its
+    body in a blanket `except` that returns HTTP 500, so a signature change would
+    turn "the plugin quietly stopped helping" into a hard failure on every VOD
+    request. Fail-open covers what happens INSIDE the wrapper; only forwarding
+    covers what happens before it is entered.
+
+    Correctness note (this wrapper only REORDERS): it never fetches or adds
+    candidates -- it re-ranks the exact candidate list the original returns, and
+    reads only the two known preferred_* params. So any filter/restriction the
+    original applies (a future param included) is already baked into that list and
+    is preserved by reordering; there is nothing a new parameter could make us
+    undo. Forwarding is therefore sufficient today -- nothing new to honour.
+    """
     if not _ACTIVE:
         return _orig_get_content_and_relation(
-            content_type, content_id, preferred_m3u_account_id, preferred_stream_id
+            content_type, content_id, preferred_m3u_account_id, preferred_stream_id,
+            *args, **kwargs
         )
 
     _log_pid_once("select")
 
     content_obj, relation, candidates = _orig_get_content_and_relation(
-        content_type, content_id, preferred_m3u_account_id, preferred_stream_id
+        content_type, content_id, preferred_m3u_account_id, preferred_stream_id,
+        *args, **kwargs
     )
 
     try:
