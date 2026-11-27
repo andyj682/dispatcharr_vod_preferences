@@ -38,7 +38,10 @@ most-specific-first ladder:
      the same video tier. When "avoid DV without fallback" is on, a Dolby-Vision
      stream with no HDR10/SDR/HLG base layer is demoted below every compatible
      stream (the TOP key) so a playable copy wins; it's only served if nothing
-     else is available.
+     else is available. When "avoid low-bitrate copies" is on, a copy whose
+     video bitrate is below its tier's minimum ranks after the healthy copies
+     of the SAME tier (before audio), and a clearly higher bitrate is the last
+     tiebreak. Full key: (compatible, tier, not starved, audio, bitrate band).
   4. Native -- account priority, untouched.
 
 Composition: this plugin only reads/re-orders the relation list. It never
@@ -69,14 +72,18 @@ the wrapper falls back to the native `(content_obj, relation, candidates)`.
 Config + saved picks are read through a short in-process TTL cache so a client's
 "open-file burst" of a few requests costs at most one small DB read, and the
 cache is invalidated immediately on our own writes. Under uWSGI's 4 lazy-apps
-workers, enable + restart so every worker imports and patches; confirm from the
-per-worker `[VOD-PREF] active ... pid=` log lines.
+workers, enable + restart so every worker imports and patches. Each process
+records its install state in a small Redis hash at install/uninstall, and the
+Status action reports the stream-serving (uWSGI) workers from it -- since
+Dispatcharr 0.34 the action itself runs in a Celery worker that never serves
+streams, so "active in THIS process" stopped being the useful answer.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import re
 import threading
@@ -131,6 +138,51 @@ DEFAULT_PREFER_QUALITY = "off"
 DEFAULT_REMEMBER_UI_PICKS = True
 DEFAULT_PREFER_AUDIO = False
 DEFAULT_AVOID_DV_NO_FALLBACK = False
+DEFAULT_AVOID_LOW_BITRATE = False
+
+# Minimum video bitrate per tier, in Mbps of H.264-equivalent video (see
+# _CODEC_EFFICIENCY). A copy below its tier's minimum is "starved". Defaults were
+# set from a survey of a large real-world library: each sits near the 5th-10th
+# percentile of its tier, so only clearly broken encodes are caught. 0 (or any
+# non-positive value) turns the minimum off for that tier.
+DEFAULT_MIN_BITRATE = {"4k": 6.0, "1080p": 1.5, "720p": 0.8, "480p": 0.4}
+MIN_BITRATE_SETTING = {tier: "min_bitrate_" + tier for tier in DEFAULT_MIN_BITRATE}
+
+# Newer codecs reach the same visual quality at a lower bitrate. Multiplying a
+# copy's measured bitrate by its codec's factor gives an "H.264-equivalent"
+# figure, so one minimum per tier works across codecs. Unlisted codecs = 1.0.
+_CODEC_EFFICIENCY = {
+    "hevc": 1.5, "h265": 1.5, "av1": 1.5, "vp9": 1.3,
+    "mpeg2video": 0.6, "mpeg4": 0.8,
+}
+
+# Providers store a file's total bitrate in kbps (e.g. 4842); ffprobe output
+# (incl. vod_merge's enrichment) stores bps (e.g. "4841229"). No real video file
+# is below 200 kbps or above 200,000 kbps, so the magnitude says which it is.
+_KBPS_CUTOFF = 200000
+# A per-track video bitrate below 50 kbps is not a real measurement.
+_MIN_VIDEO_BPS = 50000
+# Final tiebreak buckets: bitrates within the same ~1.5x band tie, so two copies
+# of the same release (or near-identical encodes) keep their native order.
+_BITRATE_BUCKET_RATIO = 1.5
+
+# Dispatcharr 0.33+ lets a user tag a VOD category with a quality. Values are
+# validated by core (apps/vod/utils.QUALITY_ORDER).
+_CATEGORY_QUALITY_TIERS = {
+    "4k": "4k", "1080p": "1080p", "720p": "720p", "480p": "480p", "sd": "480p",
+}
+# How long "does ANY category carry a quality tag?" is cached. While the answer is
+# no (the common case), the category rung costs nothing per request.
+CATEGORY_TAGS_TTL_SECONDS = 300.0
+# Attribute used to hand a pre-fetched category tier to quality_tier() without
+# changing its signature (set per selection, on the relation objects themselves).
+_CAT_TIER_ATTR = "_vodpref_category_tier"
+
+# Per-worker install registry (Redis hash), read by the Status action. Since
+# Dispatcharr 0.34 actions run in a Celery worker that never serves streams, so
+# "is the patch active HERE?" no longer answers the real question.
+WORKERS_REDIS_KEY = "dispatcharr_vod_preferences:workers"
+WORKER_RECORD_MAX_AGE = 14 * 86400   # prune records older than this on write
 
 # Quality-token patterns, checked most-specific-first so "UHD"/"FHD" resolve
 # before the plain "HD" of the 720p tier. Each token must be bounded by a
@@ -183,6 +235,10 @@ _pid_logged = set()
 _cfg_lock = threading.Lock()
 _cfg_cache = None
 _cfg_cache_ts = 0.0
+
+# Cached answer to "does any category carry a quality tag?" -> (bool, ts).
+_cat_tags_lock = threading.Lock()
+_cat_tags_cache = None
 
 
 # --------------------------------------------------------------------------- #
@@ -324,7 +380,11 @@ def quality_tier(relation):
       3. the provider STREAM name (movies: 'basic_data'.'name'; episodes:
          'info'.'title' / 'info'.'name') -- the reliable per-stream signal when
          the provider puts '4K'/'2160p'/etc. in the title and dims are absent
-      4. the provider/ACCOUNT name (relation.m3u_account.name) -- catches the
+      4. the CATEGORY quality tag (Dispatcharr 0.33+; set per category in the
+         VOD category filter UI). User-asserted for a whole category, so it
+         ranks below anything that describes this one stream. Read from a value
+         pre-fetched per selection (_annotate_category_tiers); absent -> skipped.
+      5. the provider/ACCOUNT name (relation.m3u_account.name) -- catches the
          common "separate 4K provider" setup where quality is encoded at the
          account level (e.g. an account named "... 4K"); this is the only 4K
          signal for episodes whose stream titles don't carry it
@@ -370,7 +430,12 @@ def quality_tier(relation):
         if tier:
             return tier
 
-    # 4. Provider / account name.
+    # 4. Category quality tag (pre-fetched; None when untagged or unavailable).
+    tier = getattr(relation, _CAT_TIER_ATTR, None)
+    if tier in _QUALITY_PRIORITY["4k"]:
+        return tier
+
+    # 5. Provider / account name.
     account = getattr(relation, "m3u_account", None)
     if account is not None:
         tier = _tier_from_text(getattr(account, "name", None))
@@ -546,6 +611,216 @@ def _is_dv_no_fallback(relation) -> bool:
 
 
 # --------------------------------------------------------------------------- #
+# Video bitrate (optional "avoid low-bitrate copies" rule)
+# --------------------------------------------------------------------------- #
+
+def _num(value):
+    """A positive float from an int/float/numeric string, else None."""
+    try:
+        f = float(str(value).strip().split()[0])
+    except Exception:
+        return None
+    return f if f > 0 else None
+
+
+def _to_bps(value):
+    """A file's TOTAL bitrate in bps. Providers store kbps, ffprobe stores bps."""
+    n = _num(value)
+    if n is None:
+        return None
+    return n * 1000.0 if n < _KBPS_CUTOFF else n
+
+
+def _detail_dicts(relation):
+    """The per-stream detail dicts, in the order the other readers use, plus
+    vod_merge's own ffprobe record (movies) last."""
+    cp = _custom_props(relation)
+    info = cp.get("info") if isinstance(cp.get("info"), dict) else None
+    out = [d for d in (cp.get("detailed_info"), info, cp.get("basic_data")) if isinstance(d, dict)]
+    if info is not None and isinstance(info.get("info"), dict):
+        out.append(info["info"])
+    if isinstance(cp.get("ffprobe_info"), dict):
+        out.append(cp["ffprobe_info"])
+    return out
+
+
+def _first_video(relation):
+    for v in _iter_video_dicts(relation):
+        if not _is_cover_image(v):
+            return v
+    return None
+
+
+def _track_bps(track):
+    """A single track's own bitrate in bps (its bit_rate, or an MKV BPS tag)."""
+    if not isinstance(track, dict):
+        return None
+    tags = track.get("tags") if isinstance(track.get("tags"), dict) else {}
+    for value in (tags.get("BPS"), tags.get("BPS-eng"), track.get("bit_rate")):
+        bps = _num(value)
+        if bps and bps >= _MIN_VIDEO_BPS:
+            return bps
+    return None
+
+
+def video_bitrate_bps(relation):
+    """Best estimate of the VIDEO bitrate in bps -> (bps, source) or (None, None).
+
+    Prefers the video track's own figure. Otherwise uses the file's total minus
+    its (first) audio track: totals include every audio track, and a copy with
+    many language tracks can look far better than its video is. When no audio
+    figure exists the total is used as-is, which can only overstate the video --
+    the safe direction for a rule that demotes LOW bitrates.
+    """
+    track = _track_bps(_first_video(relation))
+    if track:
+        return track, "video"
+    total = None
+    for d in _detail_dicts(relation):
+        if d.get("bitrate") not in (None, ""):
+            total = _to_bps(d.get("bitrate"))
+            if total:
+                break
+    if not total:
+        return None, None
+    audio = _audio_dict(relation)
+    abps = None
+    if isinstance(audio, dict):
+        atags = audio.get("tags") if isinstance(audio.get("tags"), dict) else {}
+        abps = _num(audio.get("bit_rate")) or _num(atags.get("BPS")) or _num(atags.get("BPS-eng"))
+    if abps and total - abps >= _MIN_VIDEO_BPS:
+        return total - abps, "total-audio"
+    return total, "total"
+
+
+def effective_mbps(relation):
+    """Video bitrate in Mbps of H.264-equivalent quality, or None when unknown."""
+    bps, _src = video_bitrate_bps(relation)
+    if not bps:
+        return None
+    codec = str((_first_video(relation) or {}).get("codec_name") or "").strip().lower()
+    return bps * _CODEC_EFFICIENCY.get(codec, 1.0) / 1e6
+
+
+def is_starved(relation, floors) -> bool:
+    """True when a copy's video bitrate is below its tier's minimum.
+
+    Positive-only, like DV detection: unknown tier, unknown bitrate or no
+    minimum for the tier -> False, so missing data never demotes a copy.
+    """
+    if not floors:
+        return False
+    floor = floors.get(quality_tier(relation))
+    if not floor:
+        return False
+    mbps = effective_mbps(relation)
+    return mbps is not None and mbps < floor
+
+
+def bitrate_bucket(relation) -> int:
+    """Coarse bitrate band (higher = better) for the final tiebreak; 0 = unknown.
+
+    Bands are ~1.5x wide so near-identical encodes tie and keep native order.
+    """
+    mbps = effective_mbps(relation)
+    if not mbps:
+        return 0
+    return max(1, 1 + int(math.floor(math.log(mbps * 1000.0) / math.log(_BITRATE_BUCKET_RATIO))))
+
+
+def _bitrate_label(relation):
+    """'4.58Mbps-eq' for logs, or None when unknown."""
+    mbps = effective_mbps(relation)
+    return None if mbps is None else "%.2fMbps-eq" % mbps
+
+
+# --------------------------------------------------------------------------- #
+# Category quality tag (Dispatcharr 0.33+)
+# --------------------------------------------------------------------------- #
+
+def _category_tags_exist() -> bool:
+    """Does ANY category relation carry a quality tag? Cached for a few minutes,
+    so an install with no tags pays nothing per request. Errors (older
+    Dispatcharr, DB hiccup) read as "no" -- the rung simply stays dormant."""
+    global _cat_tags_cache
+    now = time.time()
+    with _cat_tags_lock:
+        if _cat_tags_cache is not None and now - _cat_tags_cache[1] < CATEGORY_TAGS_TTL_SECONDS:
+            return _cat_tags_cache[0]
+    try:
+        from apps.vod.models import M3UVODCategoryRelation
+        exists = M3UVODCategoryRelation.objects.filter(
+            custom_properties__has_key="quality"
+        ).exists()
+    except Exception as exc:
+        logger.debug("[VOD-PREF] category tag check failed (%s); treating as none", exc)
+        exists = False
+    with _cat_tags_lock:
+        _cat_tags_cache = (bool(exists), time.time())
+    return bool(exists)
+
+
+def _category_tier_from_props(props):
+    if not isinstance(props, dict):
+        return None
+    value = props.get("quality")
+    if not isinstance(value, str):
+        return None
+    return _CATEGORY_QUALITY_TIERS.get(value.strip().lower())
+
+
+def _annotate_category_tiers(candidates) -> None:
+    """Attach each candidate's category quality tier (or None) for quality_tier().
+
+    Movies carry their category directly; episodes through their series
+    relation. At most two small queries per selection, and none at all while no
+    category is tagged. Any failure leaves every candidate un-annotated (None),
+    which is exactly today's behavior.
+    """
+    for c in candidates:
+        try:
+            setattr(c, _CAT_TIER_ATTR, None)
+        except Exception:
+            pass
+    if not candidates or not _category_tags_exist():
+        return
+    try:
+        from apps.vod.models import M3USeriesRelation, M3UVODCategoryRelation
+
+        series_rel_ids = {getattr(c, "series_relation_id", None) for c in candidates} - {None}
+        series_cat = {}
+        if series_rel_ids:
+            series_cat = dict(
+                M3USeriesRelation.objects.filter(id__in=series_rel_ids).values_list("id", "category_id")
+            )
+
+        def cat_of(c):
+            cat = getattr(c, "category_id", None)
+            if cat is None:
+                cat = series_cat.get(getattr(c, "series_relation_id", None))
+            return cat
+
+        wanted = {(c.m3u_account_id, cat_of(c)) for c in candidates}
+        wanted = {pair for pair in wanted if pair[1] is not None}
+        if not wanted:
+            return
+        rows = M3UVODCategoryRelation.objects.filter(
+            m3u_account_id__in={a for a, _ in wanted},
+            category_id__in={k for _, k in wanted},
+        ).values_list("m3u_account_id", "category_id", "custom_properties")
+        tiers = {(a, k): _category_tier_from_props(p) for a, k, p in rows}
+        for c in candidates:
+            setattr(c, _CAT_TIER_ATTR, tiers.get((c.m3u_account_id, cat_of(c))))
+    except Exception as exc:
+        logger.debug("[VOD-PREF] category tag lookup failed (%s); ignoring tags", exc)
+        for c in candidates:
+            try:
+                setattr(c, _CAT_TIER_ATTR, None)
+            except Exception:
+                pass
+
+
+# --------------------------------------------------------------------------- #
 # Title keys
 # --------------------------------------------------------------------------- #
 
@@ -709,6 +984,24 @@ def _write_picks(mutate) -> int:
     return count
 
 
+def _parse_floors(settings) -> dict:
+    """{tier: Mbps} from the min_bitrate_* settings. Blank/invalid -> the default;
+    0 or negative -> no minimum for that tier (omitted)."""
+    floors = {}
+    for tier, default in DEFAULT_MIN_BITRATE.items():
+        raw = settings.get(MIN_BITRATE_SETTING[tier]) if isinstance(settings, dict) else None
+        if raw is None or (isinstance(raw, str) and not raw.strip()):
+            value = default
+        else:
+            try:
+                value = float(str(raw).strip())
+            except (TypeError, ValueError):
+                value = default
+        if value > 0:
+            floors[tier] = value
+    return floors
+
+
 def _load_config(force: bool = False) -> dict:
     """Return {prefer_quality, remember_ui_picks, saved_picks}, TTL-cached.
 
@@ -747,6 +1040,11 @@ def _load_config(force: bool = False) -> dict:
             settings.get("avoid_dv_no_fallback", DEFAULT_AVOID_DV_NO_FALLBACK),
             DEFAULT_AVOID_DV_NO_FALLBACK,
         ),
+        "avoid_low_bitrate": _as_bool(
+            settings.get("avoid_low_bitrate", DEFAULT_AVOID_LOW_BITRATE),
+            DEFAULT_AVOID_LOW_BITRATE,
+        ),
+        "min_bitrate": _parse_floors(settings),
         "saved_picks": picks if isinstance(picks, dict) else {},
     }
     with _cfg_lock:
@@ -877,32 +1175,42 @@ def _log_label(content_obj, relation):
     return f"as:{relation.m3u_account_id}:{relation.stream_id}"
 
 
-def _quality_ranked(candidates, prefer, use_audio=False, avoid_dv=False):
+def _quality_ranked(candidates, prefer, use_audio=False, avoid_dv=False, floors=None):
     """Stable-sort candidates (best first) by a composite key.
 
-    Key = (compatible, quality_rank, audio_rank), all higher-is-better:
+    Key = (compatible, quality_rank, not_starved, audio_rank, bitrate_bucket),
+    all higher-is-better:
       * compatible -- when *avoid_dv* is on, a Dolby-Vision-without-fallback
         stream scores 0 and everything else 1, so a PLAYABLE stream outranks a
         no-fallback DV stream even of higher resolution. Off -> all 1 (no effect).
       * quality_rank -- the prefer_quality ladder (0 when prefer is off/unset).
-      * audio_rank -- SECONDARY tiebreak within a video tier, only when
-        *use_audio* and a quality preference are both active.
+      * not_starved -- when *floors* is given (avoid-low-bitrate on) and a
+        quality preference is active: a copy below its tier's minimum bitrate
+        scores 0, so within one tier a healthy copy wins. It never crosses
+        tiers (it sits AFTER quality_rank). Unknown bitrate -> 1 (not starved).
+      * audio_rank -- tiebreak within a video tier, only when *use_audio* and a
+        quality preference are both active.
+      * bitrate_bucket -- LAST tiebreak (same activation as not_starved): a
+        clearly higher bitrate wins; near-identical ones tie; unknown -> 0.
     The sort is stable, so streams equal on every active key keep native order.
     """
     quality_on = bool(prefer) and prefer != "off"
     priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"]) if quality_on else None
+    use_bitrate = quality_on and floors is not None
     return sorted(
         candidates,
         key=lambda c: (
             0 if (avoid_dv and _is_dv_no_fallback(c)) else 1,
             quality_rank(c, priority) if priority else 0,
+            0 if (use_bitrate and is_starved(c, floors)) else 1,
             audio_rank(c) if (quality_on and use_audio) else 0,
+            bitrate_bucket(c) if use_bitrate else 0,
         ),
         reverse=True,
     )
 
 
-def _finalize_show_pick(chosen, candidates, prefer, use_audio=False, avoid_dv=False):
+def _finalize_show_pick(chosen, candidates, prefer, use_audio=False, avoid_dv=False, floors=None):
     """A TV show pick names a PROVIDER (account). Keep that provider, but still
     honour the quality rule and DV-avoidance WITHIN it -- so when one provider
     carries both the 4K and non-4K copy of an episode, Prefer 4K picks the 4K
@@ -913,7 +1221,7 @@ def _finalize_show_pick(chosen, candidates, prefer, use_audio=False, avoid_dv=Fa
     same = [c for c in candidates if c.m3u_account_id == acct]
     other = [c for c in candidates if c.m3u_account_id != acct]
     if same and ((prefer and prefer != "off") or avoid_dv):
-        same = _quality_ranked(same, prefer, use_audio, avoid_dv)
+        same = _quality_ranked(same, prefer, use_audio, avoid_dv, floors)
     primary = same[0] if same else chosen
     return primary, same + other
 
@@ -926,6 +1234,7 @@ def _apply_preferences(content_obj, relation, candidates,
     prefer = cfg["prefer_quality"]
     use_audio = cfg["prefer_audio"]
     avoid_dv = cfg["avoid_dv_no_fallback"]
+    floors = cfg["min_bitrate"] if cfg.get("avoid_low_bitrate") else None
 
     # 1. Explicit request pick: the caller asked for a specific stream OR a
     #    specific account and the original honoured it. The movie UI sends
@@ -939,13 +1248,20 @@ def _apply_preferences(content_obj, relation, candidates,
             _persist_pick(content_obj, relation)
         return relation, candidates, "request-pick"
 
+    # Category quality tags feed the quality waterfall; fetch them once for the
+    # whole candidate list (free when no category is tagged).
+    quality_on = bool(prefer) and prefer != "off"
+    if quality_on:
+        _annotate_category_tiers(candidates)
+
     # 2. Saved UI pick for this title. Movies pin the exact stream; TV pins the
     #    provider for the whole series and still honours the quality rule within it.
     if remember:
         chosen = _lookup_saved(content_obj, candidates, cfg["saved_picks"])
         if chosen is not None:
             if _is_episode(content_obj):
-                primary, ordered = _finalize_show_pick(chosen, candidates, prefer, use_audio, avoid_dv)
+                primary, ordered = _finalize_show_pick(chosen, candidates, prefer, use_audio,
+                                                       avoid_dv, floors)
             else:
                 primary, ordered = chosen, _front(candidates, chosen)
             return primary, ordered, "saved-pick"
@@ -956,10 +1272,9 @@ def _apply_preferences(content_obj, relation, candidates,
     #    audio tiebreak order the rest. Audio can also decide when there's no
     #    video signal but an audio one is present; otherwise a no-signal quality
     #    result (and a DV-avoidance that changed nothing) falls through to native.
-    quality_on = bool(prefer) and prefer != "off"
     if quality_on or avoid_dv:
         priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"]) if quality_on else None
-        ranked = _quality_ranked(candidates, prefer, use_audio, avoid_dv)
+        ranked = _quality_ranked(candidates, prefer, use_audio, avoid_dv, floors)
         top = ranked[0] if ranked else None
         if top is not None:
             has_quality = quality_on and quality_rank(top, priority) > 0
@@ -1030,16 +1345,127 @@ def patched_get_content_and_relation(content_type, content_id,
             changed = new_relation.id != relation.id
             logger.debug(
                 "[VOD-PREF] %s %s: %s -> account %s stream %s (tier=%s, audio=%s, "
-                "dv_nofallback=%s, changed=%s, candidates=%d)",
+                "bitrate=%s, dv_nofallback=%s, changed=%s, candidates=%d)",
                 content_type, _log_label(content_obj, new_relation), reason,
                 new_relation.m3u_account_id, new_relation.stream_id,
                 quality_tier(new_relation), _audio_label(new_relation),
+                _bitrate_label(new_relation),
                 _is_dv_no_fallback(new_relation), changed, len(new_candidates),
             )
         return content_obj, new_relation, new_candidates
     except Exception as exc:
         logger.error("[VOD-PREF] preference logic error, using native selection: %s", exc)
         return content_obj, relation, candidates
+
+
+# --------------------------------------------------------------------------- #
+# Per-worker install registry (for a truthful Status action)
+# --------------------------------------------------------------------------- #
+
+def _process_role() -> str:
+    """'uwsgi' for a stream-serving uWSGI worker, 'celery' for a Celery process,
+    else 'other'. Mirrors Dispatcharr's own process labelling."""
+    try:
+        import uwsgi  # only importable inside uWSGI
+        if uwsgi.worker_id() > 0:
+            return "uwsgi"
+    except Exception:
+        pass
+    import sys
+    argv = sys.argv or []
+    if any("celery" in str(a) for a in argv):
+        return "celery"
+    return "other"
+
+
+def _get_redis():
+    try:
+        from core.utils import RedisClient
+        return RedisClient.get_client()
+    except Exception:
+        return None
+
+
+def _worker_field() -> str:
+    import socket
+    return "%s:%s" % (socket.gethostname(), os.getpid())
+
+
+def _register_worker(active: bool) -> None:
+    """Record this process's patch state in Redis. Best effort, never raises.
+
+    Only uWSGI workers serve VOD, so they're what Status reports; other roles
+    are recorded too so Status can say where IT ran. Stale records (older than
+    WORKER_RECORD_MAX_AGE, or a dead pid on this host) are pruned here.
+    """
+    try:
+        r = _get_redis()
+        if r is None:
+            return
+        import socket
+        now = time.time()
+        r.hset(WORKERS_REDIS_KEY, _worker_field(), json.dumps({
+            "pid": os.getpid(), "host": socket.gethostname(), "role": _process_role(),
+            "active": bool(active), "ts": now,
+        }))
+        for field, raw in (r.hgetall(WORKERS_REDIS_KEY) or {}).items():
+            rec = _parse_worker_record(raw)
+            if rec is None or now - rec.get("ts", 0) > WORKER_RECORD_MAX_AGE or not _pid_alive(rec):
+                r.hdel(WORKERS_REDIS_KEY, field)
+    except Exception as exc:
+        logger.debug("[VOD-PREF] worker registry write failed: %s", exc)
+
+
+def _parse_worker_record(raw):
+    try:
+        rec = json.loads(raw)
+        return rec if isinstance(rec, dict) else None
+    except Exception:
+        return None
+
+
+def _pid_alive(rec) -> bool:
+    """False only when the record is from THIS host and its pid is gone. A record
+    from another host (separate container) can't be checked -> assumed alive."""
+    if os.name != "posix":
+        # Signal 0 is a liveness probe only on POSIX; on Windows os.kill would
+        # TERMINATE the process. Dispatcharr runs on Linux; this guards tests.
+        return True
+    try:
+        import socket
+        if rec.get("host") != socket.gethostname():
+            return True
+        os.kill(int(rec.get("pid")), 0)
+        return True
+    except ProcessLookupError:
+        return False
+    except Exception:
+        return True  # e.g. PermissionError: the pid exists
+
+
+def worker_report() -> dict:
+    """Summarize the registry for the Status action.
+
+    -> {"available": bool, "active": [pids], "inactive": [pids], "here": role}
+    "available" is False when Redis couldn't be read (Status then says so).
+    """
+    out = {"available": False, "active": [], "inactive": [], "here": _process_role()}
+    try:
+        r = _get_redis()
+        if r is None:
+            return out
+        raw = r.hgetall(WORKERS_REDIS_KEY) or {}
+        out["available"] = True
+        for value in raw.values():
+            rec = _parse_worker_record(value)
+            if not rec or rec.get("role") != "uwsgi" or not _pid_alive(rec):
+                continue
+            (out["active"] if rec.get("active") else out["inactive"]).append(rec.get("pid"))
+        out["active"].sort()
+        out["inactive"].sort()
+    except Exception as exc:
+        logger.debug("[VOD-PREF] worker registry read failed: %s", exc)
+    return out
 
 
 # --------------------------------------------------------------------------- #
@@ -1072,6 +1498,7 @@ def install() -> bool:
         logger.info(
             "[VOD-PREF] installed VOD preferences patch in worker pid=%s", os.getpid()
         )
+        _register_worker(True)
         return True
     except Exception as exc:
         logger.exception("[VOD-PREF] install failed: %s", exc)
@@ -1091,6 +1518,7 @@ def uninstall() -> bool:
         if _orig_get_content_and_relation is not None:
             vod_views._get_content_and_relation = _orig_get_content_and_relation
         logger.info("[VOD-PREF] uninstalled patch in worker pid=%s", os.getpid())
+        _register_worker(False)
         return True
     except Exception as exc:
         logger.error("[VOD-PREF] uninstall error: %s", exc)

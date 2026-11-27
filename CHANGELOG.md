@@ -5,6 +5,64 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-11-27
+
+### Added
+
+- **Avoid low-bitrate copies** — a new opt-in setting (default off). Within one
+  video quality tier, a copy whose video bitrate is below that tier's minimum is
+  ranked after the healthy copies (ahead of the audio tiebreak), and after audio a
+  clearly higher bitrate breaks any remaining tie (bitrates within about 1.5× of
+  each other tie, so copies of the same release keep their account-priority
+  order). It never moves a copy across tiers, never removes a copy from failover,
+  and never demotes a copy whose bitrate is unknown. Takes effect only when
+  **Prefer quality** is set.
+  - Bitrates are compared as **H.264-equivalent** (HEVC/AV1 ×1.5, VP9 ×1.3,
+    MPEG-2 ×0.6, MPEG-4 ×0.8).
+  - The video bitrate is read from the video track's own figure (its `BPS` tag or
+    `bit_rate`) when present, otherwise from the file's total minus its audio
+    track, otherwise the total alone. Totals are stored in kbps by providers and
+    in bps by ffprobe-based enrichment; both are handled.
+  - New **Minimum bitrate** settings per tier, defaulting to 4K 6 / 1080p 1.5 /
+    720p 0.8 / 480p 0.4 Mbps (roughly the bottom 5% of each tier in a large
+    real-world library). `0` turns a tier's minimum off.
+- **Category quality tag** as a quality signal (Dispatcharr 0.33+). A quality you
+  assign to a provider's VOD category (`4K`/`1080p`/`720p`/`480p`/`SD`) now counts
+  in the quality waterfall, below the stream name and above the account name.
+  Episodes use their series' category. While no category carries a tag the
+  plugin doesn't query categories at all, so untagged setups rank exactly as
+  before; older Dispatcharr versions simply skip this rung.
+- `tools/wanted_survey.sh` — a read-only database report (no provider calls) of
+  info coverage and video bitrates for the shows on the VOD Episode Sweep
+  watchlist (or every episode), including how many episodes a given set of
+  minimums would change. Not shipped in the plugin zip.
+
+### Changed
+
+- **Check status** now reports how many stream-serving workers have the patch
+  active. Since Dispatcharr 0.34 actions run in a background worker that never
+  serves streams, so the old "active in this worker" line described the wrong
+  process. Each process now records its install state in a small Redis hash at
+  install/uninstall (stale entries are pruned), and Status reads it.
+- The per-selection DEBUG line now includes the chosen stream's `bitrate`.
+- `tools/rank_dryrun.sh` shows each candidate's bitrate, whether it counts as
+  low-bitrate, and its category quality tag, and ranks with your bitrate
+  settings.
+
+### Docs
+
+- Updated the **Prefer quality** help text and README: movie quality selection is
+  precise wherever real dimensions exist (for example after a probing plugin has
+  enriched them) or a category is tagged; the old "movies are effectively Off or
+  prefer-4K" caveat now applies only to movies with neither.
+
+### Tests
+
+- 58 new checks (187 total): bitrate reading in both storage units, codec credit,
+  starved demotion and its placement, the bitrate tiebreak, the per-tier minimums,
+  category tags (including the untagged and unavailable cases), and the Status
+  worker registry.
+
 ## [1.3.3] - 2026-09-15
 
 No functional change to selection logic — hardening + docs.
@@ -184,6 +242,7 @@ Initial release.
   so the plugin can only choose among the streams Dispatcharr currently knows
   about; refresh a series to surface newly-added streams. Movies are unaffected.
 
+[1.4.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.4.0
 [1.3.3]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.3
 [1.3.2]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.2
 [1.3.1]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.1

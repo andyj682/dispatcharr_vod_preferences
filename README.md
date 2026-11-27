@@ -10,7 +10,8 @@ clients. It adds several independent, composable controls:
    tier isn't available the plugin steps *down* to lower tiers before *up* to
    higher ones, so `Prefer 1080p`/`Prefer 720p` never pull a large 4K file. Quality
    is inferred per stream from measured video dimensions, then explicit
-   quality/resolution, then the provider stream name, then the account name.
+   quality/resolution, then the provider stream name, then the category's quality
+   tag (if you set one), then the account name.
 2. **Prefer better audio** *(optional tiebreaker)* — among streams of the **same**
    video quality, prefer higher-quality audio: surround before stereo, and within
    each, lossless (TrueHD/DTS) → Dolby (AC3/EAC3) → AAC → other. It's a tiebreaker
@@ -27,6 +28,10 @@ clients. It adds several independent, composable controls:
    green/purple cast on players that can't decode DV, below every compatible
    stream — so a playable copy is served instead (a compatible 4K when another
    provider has one, otherwise the best compatible lower-resolution copy).
+5. **Avoid low-bitrate copies** *(optional)* — within the same video quality,
+   rank a copy whose video bitrate is clearly too low for its resolution (a
+   heavily squeezed re-encode) after the healthy copies, and let a clearly higher
+   bitrate break any remaining tie.
 
 You still get Dispatcharr's provider slot management and failover; this plugin
 only re-orders the candidate list Dispatcharr already built. It works with a
@@ -77,10 +82,10 @@ Plugins page → **VOD Preferences** → **Settings** tab:
   Default `Off`. A chosen tier wins when available; otherwise the plugin steps
   *down* to lower tiers before *up* to higher ones, so `Prefer 1080p`/`Prefer
   720p` never silently pull a large 4K stream. Note that on many providers sub-4K
-  streams carry no resolution label, so `1080p`/`720p` only take effect once real
-  video dimensions are known (after an advanced/detailed refresh) or the provider
-  labels the tier; where no sub-4K signal exists they stay dormant (behave like
-  `Off`).
+  streams carry no resolution label, so `1080p`/`720p` only take effect where a
+  resolution signal exists: real video dimensions (after an advanced/detailed
+  refresh, or a probing plugin), a labeled tier, or a category quality tag (see
+  below). Where no sub-4K signal exists they stay dormant (behave like `Off`).
 - **Remember my UI pick** — on/off (default **on**). Governs both capturing new
   picks and applying stored ones.
 - **Prefer better audio (tiebreaker)** — on/off (default **off**). Breaks ties by
@@ -100,12 +105,31 @@ Plugins page → **VOD Preferences** → **Settings** tab:
   lower-resolution copy; a no-fallback DV stream is served only when it's the sole
   option (fall back to a manual pick there). Only positively-tagged streams are
   affected. Leave off if your players handle Profile 5 fine.
+- **Avoid low-bitrate copies** — on/off (default **off**). Within one video
+  quality tier, a copy whose video bitrate is below the tier's minimum (next
+  settings) is ranked after the healthy copies, ahead of the audio tiebreak; then,
+  after audio, a clearly higher bitrate wins a remaining tie (bitrates within
+  about 1.5× of each other count as equal, so two copies of the same release keep
+  their account-priority order). It never moves a copy across tiers (a
+  low-bitrate 1080p still beats a 720p), never removes a copy (it stays in the
+  failover list), and never demotes a copy whose bitrate is unknown. Takes effect
+  only when **Prefer quality** is set. Bitrates are compared as **H.264-equivalent**:
+  HEVC and AV1 count 1.5× (VP9 1.3×) because they need less data for the same
+  picture. The video bitrate comes from the video track's own figure when the
+  provider records one, otherwise from the file's total minus its audio track.
+- **Minimum bitrate, 4K / 1080p / 720p / 480p (Mbps)** — the per-tier minimums
+  for the setting above, in H.264-equivalent video Mbps. Defaults **6 / 1.5 / 0.8
+  / 0.4**, chosen from a survey of a large real-world library so that only roughly
+  the bottom 5% of each tier counts as low-bitrate. Set a tier to `0` to
+  turn its minimum off.
 - **Title key to clear** — a text box used only by the **Clear one** action below.
 
 **Actions** tab:
 
-- **Check status** — is the patch live in this worker, plus current config and
-  saved-pick count.
+- **Check status** — how many stream-serving workers have the patch active, plus
+  current settings and the saved-pick count. (Since Dispatcharr 0.34 this button
+  runs in a background worker that never serves streams, so the plugin reports
+  what each stream-serving worker recorded when it installed the patch.)
 - **List saved picks** — dump the remembered map (`title key → provider/stream`).
 - **Clear one** — type a pick's key (from *List saved picks*, e.g. `tmdb:954` or
   `series:…`, or a bare tmdb/imdb id) into the **Title key to clear** box on the
@@ -123,7 +147,7 @@ most-specific-first:
 |---|------|---------------|
 | 1 | **Explicit request pick** | The request named a specific stream (`stream_id`, movie UI play) or provider (`m3u_account_id`, series/episode UI play). Passed through untouched; if *Remember my UI pick* is on, it's saved as this title's default. |
 | 2 | **Saved UI pick** | A remembered pick for this title. **Movies** pin the exact `(provider, stream)`. **TV pins the provider for the whole series** and still applies the quality rule *within* that provider (so Prefer 4K picks the 4K copy when one provider carries both). Dropped automatically if the provider no longer carries the title. |
-| 3 | **Quality rule / DV-avoidance** | *Prefer quality* is set and/or *Avoid DV without fallback* is on. Candidates are stable-sorted by a composite key: DV-without-fallback demotion (top, when enabled) → video quality → audio (when *Prefer better audio* is on). The best becomes primary and failover follows that order. |
+| 3 | **Quality rule / DV-avoidance** | *Prefer quality* is set and/or *Avoid DV without fallback* is on. Candidates are stable-sorted by a composite key: DV-without-fallback demotion (top, when enabled) → video quality → low-bitrate demotion (when *Avoid low-bitrate copies* is on) → audio (when *Prefer better audio* is on) → higher bitrate (when *Avoid low-bitrate copies* is on). The best becomes primary and failover follows that order. |
 | 4 | **Native** | None of the above — untouched account priority. |
 
 Streams with no quality signal keep their native account-priority order (the sort
@@ -144,7 +168,14 @@ text label, so a stream mislabeled `4K` whose real track is 1920×1080 ranks as
 3. The **provider stream name** (movies: `basic_data.name`; episodes:
    `info.title`) — the reliable signal when dims are absent and the provider puts
    `4K`/`2160p` in the title.
-4. The **provider/account name** (`m3u_account.name`) — catches the "separate 4K
+4. The **category quality tag** (Dispatcharr 0.33+) — a quality you assign to a
+   provider's VOD category in Dispatcharr's category filter (`4K`, `1080p`,
+   `720p`, `480p` or `SD`, which counts as 480p). Episodes use their series'
+   category. It describes a whole category rather than one stream, so it ranks
+   below anything that describes the stream itself. Untagged categories are
+   simply skipped, and while no category carries a tag the plugin doesn't look
+   them up at all, so rankings are exactly as without this rung.
+5. The **provider/account name** (`m3u_account.name`) — catches the "separate 4K
    provider" setup (an account named e.g. `… 4K`), and is often the only 4K marker
    for episodes whose titles don't carry it.
 
@@ -156,16 +187,19 @@ Matching is **word-boundary** based, so free-text names don't misfire
 > unambiguous tokens.
 
 **Quality tiering on movies vs TV.** The waterfall above means the *precision* of
-the quality control differs by content type. TV episodes usually carry measured
-video dimensions (from the provider's per-stream probe), so every tier works
-exactly. Movies on many providers carry no per-stream dimensions and label only
-the 4K copies in the title, so their sub-4K copies read as *unknown* tier. Because
-any recognized tier — including 4K, which sits at the bottom of the 1080p/720p
-ladders — outranks an unknown one, on such movies **any active quality setting
-tends to serve the 4K-labeled copy** (and does nothing when nothing is labeled).
-To reliably prefer sub-4K on movies you'd need real per-stream dimensions (e.g. an
-ffprobe-based enrichment pass); until then, movie quality selection is effectively
-"Off or prefer-4K."
+the quality control depends on what Dispatcharr knows about each copy. TV episodes
+usually carry measured video dimensions (from the provider's per-stream probe), so
+every tier works exactly. Movies on many providers carry no per-stream dimensions
+and label only the 4K copies in the title, so their sub-4K copies read as
+*unknown* tier. Because any recognized tier — including 4K, which sits at the
+bottom of the 1080p/720p ladders — outranks an unknown one, on such movies **any
+active quality setting tends to serve the 4K-labeled copy** (and does nothing when
+nothing is labeled). Two things close that gap: a plugin that probes movie
+streams and records their real dimensions (for example
+[VOD Merge & Enrich](https://github.com/andyj682/dispatcharr_vod_merge)), and
+category quality tags for providers that sort movies into per-quality
+categories. Bitrate works the same way: the low-bitrate rule can only act on
+copies whose bitrate is recorded.
 
 **Movies vs TV — an asymmetry rooted in the UI.** A movie play sends the exact
 `stream_id`, so movie picks pin the exact stream. A series play sends only the
@@ -201,11 +235,11 @@ Each worker logs once at boot / first hit (INFO — always visible):
 [VOD-PREF] active in worker pid=<PID> at select
 ```
 
-After enabling + restarting, collect the distinct `pid=` values across a few
-plays. You should see **more than one** worker PID. If you only ever see one, the
-patch isn't in every worker — restart again and re-check. (The **Check status**
-button only reports the one worker that handled that click, so the logs are the
-real confirmation.)
+After enabling + restarting, click **Check status**: it lists the
+stream-serving workers that have the patch active (it should be more than one),
+and any that report it inactive. The logs are the backup check: collect the
+distinct `pid=` values across a few plays; if you only ever see one, the patch
+isn't in every worker, so restart again and re-check.
 
 ### Watch the plugin make decisions (enable DEBUG)
 
@@ -220,13 +254,14 @@ docker logs -f <dispatcharr-container> 2>&1 | grep "VOD-PREF"
 A decision line reads:
 
 ```
-[VOD-PREF] episode tmdb:12345: quality:4k -> account 7 stream 900001 (tier=4k, audio=eac3/6ch, dv_nofallback=False, changed=True, candidates=5)
+[VOD-PREF] episode tmdb:12345: quality:4k -> account 7 stream 900001 (tier=4k, audio=eac3/6ch, bitrate=23.40Mbps-eq, dv_nofallback=False, changed=True, candidates=5)
 ```
 
 - `reason` — which rung fired: `request-pick`, `saved-pick`, `quality:4k`,
   `quality:4k:no-signal`, `avoid-dv`, or nothing logged = `native`.
-- `tier` / `audio` / `dv_nofallback` — the chosen stream's video tier, audio
-  (codec/channels), and whether it's Dolby Vision without an HDR/SDR fallback.
+- `tier` / `audio` / `bitrate` / `dv_nofallback` — the chosen stream's video
+  tier, audio (codec/channels), H.264-equivalent video bitrate (`None` when
+  unknown), and whether it's Dolby Vision without an HDR/SDR fallback.
 - `changed=True` — the plugin moved off the native primary (it did real work);
   `changed=False` — its choice already matched native (still confirmation it ran).
 - `candidates=N` — how many streams the title has right now (see the episode
@@ -238,11 +273,24 @@ A decision line reads:
 ranking and decision for any episode straight from the current database — no
 log-level change needed. It loads the installed `patch.py` and runs the real
 ranking logic, showing the native candidate order, the plugin's pick (and why),
-and the pure ranking with `avoid_dv` off/on. Edit the `-e` variables at the top
-(an episode ID, or series name + season + episode) and run it on the Dispatcharr
-host. Especially handy when playback differs from what you expect: if the
+and the pure ranking with `avoid_dv` off/on. Each candidate line shows its tier,
+audio, bitrate, whether it counts as low-bitrate (`starved`), and its category
+quality tag if one applies. Edit the `-e` variables at the top
+(a movie or episode ID, or a title + season + episode) and run it on the
+Dispatcharr host. Especially handy when playback differs from what you expect: if the
 dry-run's pick and the served stream disagree, the difference is Dispatcharr-side
 (a provider at capacity, or an idle session being reused), not the plugin's logic.
+
+### Survey your library (bitrate and info coverage)
+
+[`tools/wanted_survey.sh`](tools/wanted_survey.sh) is a read-only report over the
+episodes of the shows on the [VOD Episode Sweep](https://github.com/andyj682/dispatcharr_vod_episode_sweep)
+watchlist (or every episode with `SCOPE="all"`). It reads only the database (no
+provider calls) and shows, per provider, how many copies carry video size, audio
+and bitrate info; the spread of video bitrates per tier against a range of
+possible minimums; the lowest-bitrate copies; and how many episodes a set of
+minimums would actually change (`FLOOR="4k=6,1080p=1.5,720p=0.8,480p=0.4"`). Use
+it to choose the **Minimum bitrate** settings for your own providers.
 
 ### Test Prefer 4K (the definitive A/B)
 
@@ -270,10 +318,11 @@ conflict:
 python test_logic.py
 ```
 Exercises the full ladder, the quality-signal waterfall (dims-first,
-cover-image exclusion, name/account fallbacks, word-boundary guards), movie exact
-picks, TV show-level picks + same-account 4K composition, capture via
-stream_id/account_id, persistence, and clear operations. No Dispatcharr or DB
-required.
+cover-image exclusion, name/category/account fallbacks, word-boundary guards),
+the low-bitrate rule (bitrate reading in both storage units, codec credit,
+starved demotion, the bitrate tiebreak), movie exact picks, TV show-level picks +
+same-account 4K composition, capture via stream_id/account_id, persistence, the
+Status worker registry, and clear operations. No Dispatcharr or DB required.
 
 ---
 
@@ -327,8 +376,13 @@ required.
   server-side. Movie keys: `tmdb:` → `imdb:` → `as:<account>:<stream>`. TV keys
   (per series): `stmdb:` → `simdb:` → `series:<uuid>`. Picks from a pre-1.0
   install migrate across automatically on first write.
-- **Settings** (`prefer_quality`, `remember_ui_picks`, `clear_key`): the plugin's
-  normal `PluginConfig.settings`.
+- **Settings** (`prefer_quality`, `remember_ui_picks`, `prefer_audio`,
+  `avoid_dv_no_fallback`, `avoid_low_bitrate`, `min_bitrate_*`, `clear_key`): the
+  plugin's normal `PluginConfig.settings`.
+- **Worker status** (for **Check status**): a small Redis hash,
+  `dispatcharr_vod_preferences:workers`, with one entry per process that installed
+  the patch (pid, role, active, time). Entries for exited processes are pruned
+  automatically.
 
 Dispatcharr's own VOD tables are never modified.
 

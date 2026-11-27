@@ -22,6 +22,9 @@
 #
 # Change the container name "dispatcharr" if yours differs (docker ps to check).
 #
+# bitrate = video Mbps, H.264-equivalent (1.4.0+); starved = below the tier minimum
+# (only matters when 'Avoid low-bitrate copies' is on).
+#
 # How to read the output:
 #   * NATIVE ORDER      = what Dispatcharr feeds the plugin (account priority, then id).
 #   * PLUGIN DECISION   = the plugin's actual pick + reason under your live settings.
@@ -75,17 +78,31 @@ else:
 
 cfg = vp._load_config(force=True)
 
+HAS_BITRATE = hasattr(vp, 'effective_mbps')      # 1.4.0+
+floors = cfg.get('min_bitrate') if cfg.get('avoid_low_bitrate') else None
+
 def row(c):
-    return (f"acct={c.m3u_account.name!r} prio={c.m3u_account.priority} id={c.id} "
-            f"stream={c.stream_id} tier={vp.quality_tier(c)} "
-            f"dv_nofb={vp._is_dv_no_fallback(c)} audio={vp._audio_label(c)}")
+    out = (f"acct={c.m3u_account.name!r} prio={c.m3u_account.priority} id={c.id} "
+           f"stream={c.stream_id} tier={vp.quality_tier(c)} "
+           f"dv_nofb={vp._is_dv_no_fallback(c)} audio={vp._audio_label(c)}")
+    if HAS_BITRATE:
+        mbps = vp.effective_mbps(c)
+        out += f" bitrate={'%.2f' % mbps if mbps is not None else None}"
+        out += f" starved={vp.is_starved(c, cfg.get('min_bitrate'))}"
+        cat = getattr(c, vp._CAT_TIER_ATTR, None)
+        if cat:
+            out += f" category_tag={cat}"
+    return out
 
 print(label)
 print(f"SETTINGS: prefer_quality={cfg['prefer_quality']} prefer_audio={cfg['prefer_audio']} "
-      f"avoid_dv_no_fallback={cfg['avoid_dv_no_fallback']} remember_ui_picks={cfg['remember_ui_picks']}")
+      f"avoid_dv_no_fallback={cfg['avoid_dv_no_fallback']} remember_ui_picks={cfg['remember_ui_picks']}"
+      + (f" avoid_low_bitrate={cfg.get('avoid_low_bitrate')} min_mbps={cfg.get('min_bitrate')}" if HAS_BITRATE else ""))
 
 cands = list(obj.m3u_relations.filter(m3u_account__is_active=True)
              .select_related('m3u_account').order_by('-m3u_account__priority', 'id'))
+if hasattr(vp, '_annotate_category_tiers'):
+    vp._annotate_category_tiers(cands)   # category quality tags, if any are set
 
 picks = cfg['saved_picks']
 if KIND == 'movie':
@@ -114,6 +131,7 @@ else:
 
     print("\nDETERMINISTIC RANKING under prefer=4k (independent of session/capacity):")
     for av in (False, True):
-        r = vp._quality_ranked(cands, "4k", cfg['prefer_audio'], av)
+        r = (vp._quality_ranked(cands, "4k", cfg['prefer_audio'], av, floors) if HAS_BITRATE
+             else vp._quality_ranked(cands, "4k", cfg['prefer_audio'], av))
         print(f"  avoid_dv={av} -> " + str([(c.m3u_account.name, c.stream_id, vp.quality_tier(c)) for c in r]))
 PY

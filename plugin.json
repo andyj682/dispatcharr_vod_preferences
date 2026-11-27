@@ -1,6 +1,6 @@
 {
   "name": "VOD Preferences",
-  "version": "1.3.3",
+  "version": "1.4.0",
   "description": "Greater control over which VOD stream Dispatcharr serves through its proxy for a given title: prefer higher video/audio qualities across providers, and/or remember a stream selected in the UI as that title's durable default.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_preferences",
@@ -10,12 +10,24 @@
       "label": "Prefer quality",
       "type": "select",
       "default": "off",
-      "help_text": "Sets the highest video quality to prefer. Quality is inferred from actual video pixel dimensions, explicit quality/resolution, provider stream name, and M3U account name (e.g., a '4K' provider), in that order. A chosen tier wins when available; otherwise lower priorities are tried before higher ones in descending order. Streams with no quality signal keep their native account-priority order. Most precise on TV, which carries measured resolution; on movies, providers commonly label only 4K, so any tier there mainly prefers a 4K-labeled copy when present and can't pick an unlabeled 1080p/720p.",
+      "help_text": "Sets the highest video quality to prefer. Quality is inferred from actual video pixel dimensions, explicit quality/resolution, provider stream name, the category's quality tag (if you set one), and M3U account name (e.g., a '4K' provider), in that order. A chosen tier wins when available; otherwise lower priorities are tried before higher ones in descending order. Streams with no quality signal keep their native account-priority order. Precise wherever measured resolution exists (most TV, and movies enriched by a probing plugin); for movies with no measurements, a tagged category or a '4K' label in the stream name is what tells copies apart.",
       "options": [
-        { "value": "off", "label": "Off (native account priority)" },
-        { "value": "4k", "label": "Prefer 4K" },
-        { "value": "1080p", "label": "Prefer 1080p" },
-        { "value": "720p", "label": "Prefer 720p" }
+        {
+          "value": "off",
+          "label": "Off (native account priority)"
+        },
+        {
+          "value": "4k",
+          "label": "Prefer 4K"
+        },
+        {
+          "value": "1080p",
+          "label": "Prefer 1080p"
+        },
+        {
+          "value": "720p",
+          "label": "Prefer 720p"
+        }
       ]
     },
     {
@@ -40,6 +52,41 @@
       "help_text": "Demote Dolby Vision streams with no HDR10/SDR base layer (Profile 5) to lowest priority to avoid playback compatibility issues. Leave off if your players handle Profile 5 fine."
     },
     {
+      "id": "avoid_low_bitrate",
+      "label": "Avoid low-bitrate copies",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Within the same video quality, rank a copy whose video bitrate is below the minimum for its tier (settings below) after the healthy copies, and let a clearly higher bitrate break any remaining tie. Bitrates are compared as H.264-equivalent (HEVC/AV1 count 1.5x). Never moves a copy across quality tiers; copies with no bitrate info are never demoted. Takes effect only when Prefer quality is set."
+    },
+    {
+      "id": "min_bitrate_4k",
+      "label": "Minimum bitrate, 4K (Mbps)",
+      "type": "number",
+      "default": 6,
+      "help_text": "H.264-equivalent video Mbps below which a 4K copy counts as low-bitrate. 0 turns this tier's minimum off. Default 6."
+    },
+    {
+      "id": "min_bitrate_1080p",
+      "label": "Minimum bitrate, 1080p (Mbps)",
+      "type": "number",
+      "default": 1.5,
+      "help_text": "Same, for 1080p. Default 1.5."
+    },
+    {
+      "id": "min_bitrate_720p",
+      "label": "Minimum bitrate, 720p (Mbps)",
+      "type": "number",
+      "default": 0.8,
+      "help_text": "Same, for 720p. Default 0.8."
+    },
+    {
+      "id": "min_bitrate_480p",
+      "label": "Minimum bitrate, 480p/SD (Mbps)",
+      "type": "number",
+      "default": 0.4,
+      "help_text": "Same, for 480p and SD. Default 0.4."
+    },
+    {
       "id": "clear_key",
       "label": "Title key to clear",
       "type": "string",
@@ -51,14 +98,14 @@
       "id": "_info",
       "label": "",
       "type": "info",
-      "description": "Selection order (most specific first): explicit request pick -> saved UI pick -> quality rule -> native account priority. Use the buttons below to inspect or clear saved picks."
+      "description": "Selection order (most specific first): explicit request pick -> saved UI pick -> quality rule (avoid DV without fallback -> quality tier -> avoid low bitrate -> audio -> bitrate) -> native account priority. Use the buttons below to inspect or clear saved picks."
     }
   ],
   "actions": [
     {
       "id": "status",
       "label": "Show patch status",
-      "description": "Report whether the preferences patch is active in the worker that handles this request.",
+      "description": "Report whether the preferences patch is active in the workers that serve streams, plus current settings.",
       "button_label": "Check status",
       "button_variant": "outline"
     },
@@ -83,7 +130,10 @@
       "button_label": "Clear all",
       "button_variant": "light",
       "button_color": "red",
-      "confirm": { "title": "Clear all saved picks?", "message": "This permanently removes every remembered per-title stream pick. Quality preferences are unaffected." }
+      "confirm": {
+        "title": "Clear all saved picks?",
+        "message": "This permanently removes every remembered per-title stream pick. Quality preferences are unaffected."
+      }
     }
   ]
 }

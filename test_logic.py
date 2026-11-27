@@ -23,6 +23,8 @@ Checks the full selection ladder and the supporting helpers:
   * The ladder precedence (request > saved > quality > native) holds.
   * clear_all_saved / clear_saved_key mutate the store correctly.
   * The wrapper falls back to native selection if the ladder raises.
+  * 1.4.0: video bitrate reading/normalization, the low-bitrate rule and its
+    placement, category quality tags (incl. untagged), the Status registry.
 
 Run:  python test_logic.py     (or: py -3 test_logic.py)
 """
@@ -316,6 +318,7 @@ def reset(fields=None, picks=None, legacy_picks=None):
         CORE["exists"] = True
         CORE["value"] = dict(picks)
     patch.invalidate_config_cache()
+    patch._cat_tags_cache = None
     patch._orig_get_content_and_relation = native_stub
     patch._ACTIVE = True
 
@@ -1014,6 +1017,422 @@ def test_signature_parity():
     check("inactive: unknown keyword forwarded", rec["kwargs"].get("future_param") is sentinel_kw)
 
 
+# --------------------------------------------------------------------------- #
+# 1.4.0: video bitrate ("avoid low-bitrate copies")
+# --------------------------------------------------------------------------- #
+def BR(rid, account_id, stream_id, width=1920, height=1080, codec="h264",
+       video_bps=None, total=None, audio=None, episode=True, account_name=None):
+    """A relation carrying bitrate info in the real provider shapes.
+
+    episode=True  -> info.info.{video,audio,bitrate}  (provider episode shape;
+                     total in kbps as an int)
+    episode=False -> detailed_info.{video,audio} + ffprobe_info.bitrate (movie
+                     enriched by a probing plugin; total in bps as a string)
+    """
+    r = FakeRelation(rid, account_id, stream_id, account_name=account_name)
+    video = {"codec_name": codec, "width": width, "height": height}
+    if video_bps is not None:
+        video["tags"] = {"BPS": str(video_bps)}
+    if episode:
+        inner = {"video": video}
+        if audio is not None:
+            inner["audio"] = audio
+        if total is not None:
+            inner["bitrate"] = total
+        r.custom_properties = {"info": {"title": "Episode", "info": inner}}
+    else:
+        props = {"detailed_info": {"video": video}}
+        if audio is not None:
+            props["detailed_info"]["audio"] = audio
+        if total is not None:
+            props["ffprobe_info"] = {"bitrate": str(total)}
+        r.custom_properties = props
+    return r
+
+
+def EAC3_51():
+    a = AUD("eac3", 6)
+    a["bit_rate"] = 256000
+    return a
+
+
+FLOORS = dict(patch.DEFAULT_MIN_BITRATE)
+
+
+def test_bitrate_reading():
+    print("test_bitrate_reading")
+    # Provider total in kbps minus the audio track (the real low-bitrate case).
+    r = BR(1, 1, "a", codec="hevc", total=888, audio=EAC3_51())
+    bps, src = patch.video_bitrate_bps(r)
+    check("kbps total minus audio", src == "total-audio" and abs(bps - 632000) < 1)
+    check("HEVC counted 1.5x", abs(patch.effective_mbps(r) - 0.948) < 0.001)
+    # A video-only BPS tag wins over the total (multi-audio files mislead).
+    r = BR(2, 1, "b", video_bps=4580299, total=8955, audio=EAC3_51())
+    bps, src = patch.video_bitrate_bps(r)
+    check("video BPS tag preferred over total", src == "video" and bps == 4580299)
+    # ffprobe-style total in bps (string), no audio figure -> total as-is.
+    r = BR(3, 1, "c", total=6000000, episode=False)
+    bps, src = patch.video_bitrate_bps(r)
+    check("bps string total (enriched movie) normalized", src == "total" and bps == 6000000)
+    check("same bitrate whether stored as kbps or bps",
+          patch.effective_mbps(BR(4, 1, "d", total=6000)) == patch.effective_mbps(r))
+    # A video track's own bit_rate field also counts.
+    r = BR(5, 1, "e")
+    r.custom_properties["info"]["info"]["video"]["bit_rate"] = "3000000"
+    check("video stream bit_rate used", patch.video_bitrate_bps(r) == (3000000.0, "video"))
+    # Nonsense per-track value ignored; nothing else -> unknown.
+    r = BR(6, 1, "f", video_bps=12)
+    check("tiny per-track figure ignored -> unknown", patch.effective_mbps(r) is None)
+    check("no bitrate anywhere -> None", patch.effective_mbps(FakeRelation(7, 1, "g")) is None)
+    check("unknown bitrate -> bucket 0", patch.bitrate_bucket(FakeRelation(7, 1, "g")) == 0)
+
+
+def test_is_starved():
+    print("test_is_starved")
+    low = BR(1, 1, "a", codec="hevc", total=888, audio=EAC3_51())      # 0.95 eq @1080p
+    ok = BR(2, 1, "b", video_bps=4580299, audio=EAC3_51())             # 4.58 @1080p
+    check("0.95 Mbps-eq 1080p is starved at 1.5", patch.is_starved(low, FLOORS) is True)
+    check("4.58 Mbps 1080p is fine", patch.is_starved(ok, FLOORS) is False)
+    check("unknown bitrate never starved", patch.is_starved(FakeRelation(3, 1, "c", video=VID(1920, 1080)), FLOORS) is False)
+    check("unknown tier never starved", patch.is_starved(FakeRelation(4, 1, "d"), FLOORS) is False)
+    no_1080 = {k: v for k, v in FLOORS.items() if k != "1080p"}
+    check("tier minimum off -> never starved", patch.is_starved(low, no_1080) is False)
+    check("floors None -> never starved", patch.is_starved(low, None) is False)
+    # HEVC credit matters: 1.2 Mbps HEVC (1.8 eq) clears 1.5; 1.2 Mbps H.264 does not.
+    check("1.2 Mbps HEVC clears the 1.5 minimum",
+          patch.is_starved(BR(5, 1, "e", codec="hevc", video_bps=1200000), FLOORS) is False)
+    check("1.2 Mbps H.264 is below it",
+          patch.is_starved(BR(6, 1, "f", codec="h264", video_bps=1200000), FLOORS) is True)
+
+
+def test_parse_floors():
+    print("test_parse_floors")
+    check("no settings -> defaults", patch._parse_floors({}) == patch.DEFAULT_MIN_BITRATE)
+    f = patch._parse_floors({"min_bitrate_1080p": "2", "min_bitrate_720p": 0,
+                             "min_bitrate_4k": "abc", "min_bitrate_480p": ""})
+    check("numeric string accepted", f.get("1080p") == 2.0)
+    check("0 removes that tier's minimum", "720p" not in f)
+    check("invalid -> default", f.get("4k") == patch.DEFAULT_MIN_BITRATE["4k"])
+    check("blank -> default", f.get("480p") == patch.DEFAULT_MIN_BITRATE["480p"])
+
+
+def _bitrate_fields(on=True, **extra):
+    fields = {"prefer_quality": "4k", "remember_ui_picks": False, "prefer_audio": True,
+              "avoid_low_bitrate": on}
+    fields.update(extra)
+    return fields
+
+
+def test_low_bitrate_ranking():
+    print("test_low_bitrate_ranking")
+    # The motivating case: two 1080p E-AC3 5.1 copies; the higher-priority
+    # provider's is a 0.9 Mbps HEVC re-encode.
+    low = BR(1, 1, "low", codec="hevc", total=888, audio=EAC3_51())
+    good = BR(2, 2, "good", video_bps=4580299, total=4842, audio=EAC3_51())
+    ep = FakeEpisode(series_uuid="s1", season_number=1, episode_number=1)
+
+    reset(fields=_bitrate_fields(on=False))
+    scenario(ep, [low, good])
+    _, rel, _ = call()
+    check("setting off -> native order kept (starved copy still first)", rel.id == low.id)
+
+    reset(fields=_bitrate_fields(on=True))
+    scenario(ep, [low, good])
+    _, rel, cands = call()
+    check("setting on -> healthy copy wins", rel.id == good.id)
+    check("starved copy kept as failover (never excluded)", [c.id for c in cands] == [good.id, low.id])
+
+    # Never crosses tiers: a starved 1080p still beats a healthy 720p.
+    r720 = BR(3, 2, "720", width=1280, height=720, video_bps=3000000, audio=EAC3_51())
+    reset(fields=_bitrate_fields(on=True))
+    scenario(ep, [r720, low])
+    _, rel, _ = call()
+    check("starved 1080p still beats healthy 720p (tier first)", rel.id == low.id)
+
+    # Bitrate outranks audio: a healthy 2.0 beats a starved 5.1 in the same tier.
+    stereo_ok = BR(4, 2, "st", video_bps=4000000, audio=AUD("aac", 2))
+    reset(fields=_bitrate_fields(on=True))
+    scenario(ep, [low, stereo_ok])
+    _, rel, _ = call()
+    check("healthy stereo beats starved 5.1 within a tier", rel.id == stereo_ok.id)
+
+    # Unknown bitrate is never demoted: it beats a starved copy.
+    unknown = FakeRelation(5, 2, "unk", video=VID(1920, 1080), audio=EAC3_51())
+    reset(fields=_bitrate_fields(on=True))
+    scenario(ep, [low, unknown])
+    _, rel, _ = call()
+    check("unknown bitrate beats a starved copy", rel.id == unknown.id)
+
+    # Needs a quality preference (like the audio tiebreak).
+    reset(fields=_bitrate_fields(on=True, prefer_quality="off"))
+    scenario(ep, [low, good])
+    _, rel, _ = call()
+    check("prefer quality off -> setting has no effect", rel.id == low.id)
+
+    # Tier minimum set to 0 -> that tier is never starved.
+    reset(fields=_bitrate_fields(on=True, min_bitrate_1080p=0))
+    scenario(ep, [low, good])
+    _, rel, _ = call()
+    check("1080p minimum 0 -> not starved; only the bitrate tiebreak separates them",
+          rel.id == good.id and patch.is_starved(low, patch._parse_floors({"min_bitrate_1080p": 0})) is False)
+
+
+def test_bitrate_tiebreak():
+    print("test_bitrate_tiebreak")
+    ep = FakeEpisode(series_uuid="s1", season_number=1, episode_number=1)
+    a = BR(1, 1, "a", video_bps=3000000, audio=EAC3_51())
+    b = BR(2, 2, "b", video_bps=9000000, audio=EAC3_51())
+    reset(fields=_bitrate_fields(on=True))
+    scenario(ep, [a, b])
+    _, rel, _ = call()
+    check("clearly higher bitrate wins a full tie", rel.id == b.id)
+
+    # Same release on two providers (identical video track) -> native order.
+    c = BR(3, 1, "c", video_bps=4580299, audio=EAC3_51())
+    d = BR(4, 2, "d", video_bps=4580299, audio=EAC3_51())
+    reset(fields=_bitrate_fields(on=True))
+    scenario(ep, [c, d])
+    _, rel, _ = call()
+    check("identical bitrates tie -> native order", rel.id == c.id)
+    check("near-identical encodes share a bucket",
+          patch.bitrate_bucket(BR(5, 1, "e", video_bps=4600000)) ==
+          patch.bitrate_bucket(BR(6, 1, "f", video_bps=4700000)))
+
+    # Audio still outranks the bitrate tiebreak.
+    e = BR(7, 1, "e", video_bps=3000000, audio=EAC3_51())
+    f = BR(8, 2, "f", video_bps=9000000, audio=AUD("aac", 2))
+    reset(fields=_bitrate_fields(on=True))
+    scenario(ep, [f, e])
+    _, rel, _ = call()
+    check("better audio outranks a higher (healthy) bitrate", rel.id == e.id)
+
+    # Setting off -> the tiebreak is off too.
+    reset(fields=_bitrate_fields(on=False))
+    scenario(ep, [a, b])
+    _, rel, _ = call()
+    check("setting off -> no bitrate tiebreak", rel.id == a.id)
+
+
+def test_show_pick_honors_bitrate():
+    print("test_show_pick_honors_bitrate")
+    # Saved TV pick = provider 1, which carries a starved and a healthy 1080p copy.
+    ep = FakeEpisode(series_uuid="s1", season_number=1, episode_number=2, series_tmdb="77")
+    low = BR(1, 1, "low", codec="hevc", total=888, audio=EAC3_51())
+    good = BR(2, 1, "good", video_bps=4580299, audio=EAC3_51())
+    other = BR(3, 2, "other", video_bps=9000000, audio=EAC3_51())
+    reset(fields=_bitrate_fields(on=True, remember_ui_picks=True),
+          picks={"stmdb:77": {"m3u_account_id": 1}})
+    scenario(ep, [low, other, good])
+    _, rel, cands = call()
+    check("show pick keeps the provider, healthy copy within it", rel.id == good.id)
+    check("other provider only after the picked one", [c.id for c in cands] == [good.id, low.id, other.id])
+
+
+# --------------------------------------------------------------------------- #
+# 1.4.0: category quality tag
+# --------------------------------------------------------------------------- #
+VOD = {"cat_rows": [], "series_cat": {}, "queries": 0, "fail": False}
+
+
+class _VodQS:
+    def __init__(self, kind, flt):
+        self.kind, self.flt = kind, flt
+
+    def _rows(self):
+        VOD["queries"] += 1
+        if VOD["fail"]:
+            raise RuntimeError("db down")
+        return VOD["cat_rows"]
+
+    def exists(self):
+        return any("quality" in (p or {}) for _a, _c, p in self._rows())
+
+    def values_list(self, *fields):
+        if self.kind == "series":
+            VOD["queries"] += 1
+            ids = self.flt.get("id__in") or set()
+            return [(i, VOD["series_cat"].get(i)) for i in ids]
+        accts = self.flt.get("m3u_account_id__in") or set()
+        cats = self.flt.get("category_id__in") or set()
+        return [(a, c, p) for a, c, p in self._rows() if a in accts and c in cats]
+
+
+class _VodManager:
+    def __init__(self, kind):
+        self.kind = kind
+
+    def filter(self, **flt):
+        return _VodQS(self.kind, flt)
+
+
+class M3UVODCategoryRelation:
+    objects = _VodManager("cat")
+
+
+class M3USeriesRelation:
+    objects = _VodManager("series")
+
+
+def _install_fake_vod(enabled=True):
+    if enabled:
+        vod_mod = types.ModuleType("apps.vod")
+        vod_models = types.ModuleType("apps.vod.models")
+        vod_models.M3UVODCategoryRelation = M3UVODCategoryRelation
+        vod_models.M3USeriesRelation = M3USeriesRelation
+        sys.modules["apps.vod"] = vod_mod
+        sys.modules["apps.vod.models"] = vod_models
+    else:
+        sys.modules.pop("apps.vod", None)
+        sys.modules.pop("apps.vod.models", None)
+    patch._cat_tags_cache = None
+
+
+def _cat_rel(rid, account_id, stream_id, category_id=None, series_relation_id=None, **kw):
+    r = FakeRelation(rid, account_id, stream_id, **kw)
+    if category_id is not None:
+        r.category_id = category_id
+    if series_relation_id is not None:
+        r.series_relation_id = series_relation_id
+    return r
+
+
+def test_category_tag_absent_changes_nothing():
+    print("test_category_tag_absent_changes_nothing")
+    # Andy's setup: no category carries a quality tag. Rankings must be exactly
+    # as before and the per-request cost must be one cached existence check.
+    _install_fake_vod(enabled=True)
+    VOD.update(cat_rows=[(1, 10, {}), (2, 20, {"language": "en"})], series_cat={}, queries=0, fail=False)
+    a = _cat_rel(1, 1, "a", category_id=10)
+    b = _cat_rel(2, 2, "b", category_id=20, name="Example 4K")
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False})
+    scenario(FakeMovie(tmdb_id="1"), [a, b])
+    _, rel, _ = call()
+    check("no tags: name label still decides as before", rel.id == b.id)
+    check("no tags: candidates annotated None", getattr(a, patch._CAT_TIER_ATTR, "x") is None)
+    first = VOD["queries"]
+    scenario(FakeMovie(tmdb_id="1"), [a, b])
+    call()
+    check("no tags: existence check cached (no further queries)", VOD["queries"] == first)
+
+    # No tags + no other signal -> native order, unchanged.
+    c = _cat_rel(3, 1, "c", category_id=10)
+    d = _cat_rel(4, 2, "d", category_id=20)
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False})
+    scenario(FakeMovie(tmdb_id="1"), [c, d])
+    _, rel, cands = call()
+    check("no tags + no signal -> native", rel.id == c.id and [x.id for x in cands] == [c.id, d.id])
+
+    # Older Dispatcharr (no apps.vod.models importable) -> silently dormant.
+    _install_fake_vod(enabled=False)
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False})
+    scenario(FakeMovie(tmdb_id="1"), [c, d])
+    _, rel, _ = call()
+    check("model unavailable -> native, no error", rel.id == c.id)
+
+
+def test_category_tag_ranks():
+    print("test_category_tag_ranks")
+    _install_fake_vod(enabled=True)
+    VOD.update(cat_rows=[(1, 10, {"quality": "1080p"}), (2, 20, {"quality": "4K"}),
+                         (3, 30, {"quality": "SD"})],
+               series_cat={500: 20}, queries=0, fail=False)
+    plain = _cat_rel(1, 1, "a", category_id=10)
+    tagged4k = _cat_rel(2, 2, "b", category_id=20)
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False})
+    scenario(FakeMovie(tmdb_id="1"), [plain, tagged4k])
+    _, rel, _ = call()
+    check("4K-tagged category wins under Prefer 4K", rel.id == tagged4k.id)
+    check("category tier read", patch.quality_tier(tagged4k) == "4k" and patch.quality_tier(plain) == "1080p")
+    sd = _cat_rel(3, 3, "c", category_id=30)
+    patch._annotate_category_tiers([sd])
+    check("SD tag -> 480p", patch.quality_tier(sd) == "480p")
+
+    # Waterfall order: dims and the stream name outrank the category tag;
+    # the category tag outranks the account name.
+    dims = _cat_rel(4, 2, "d", category_id=20, video=VID(1920, 1080))
+    named = _cat_rel(5, 2, "e", category_id=20, name="Example 1080p")
+    acct = _cat_rel(6, 1, "f", category_id=10, account_name="Provider 4K")
+    patch._annotate_category_tiers([dims, named, acct])
+    check("measured dims outrank the category tag", patch.quality_tier(dims) == "1080p")
+    check("stream name outranks the category tag", patch.quality_tier(named) == "1080p")
+    check("category tag outranks the account name", patch.quality_tier(acct) == "1080p")
+
+    # Episodes read the tag through their series relation.
+    ep_rel = _cat_rel(7, 2, "g", series_relation_id=500)
+    ep_plain = _cat_rel(8, 1, "h", series_relation_id=999)
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False})
+    scenario(FakeEpisode(series_uuid="s1", season_number=1, episode_number=1), [ep_plain, ep_rel])
+    _, rel, _ = call()
+    check("episode: tag via series relation wins", rel.id == ep_rel.id)
+
+    # A lookup failure fails open (no tiers, no exception, native order).
+    VOD["fail"] = True
+    patch._cat_tags_cache = (True, __import__("time").time())  # tags "exist"
+    reset(fields={"prefer_quality": "4k", "remember_ui_picks": False})
+    patch._cat_tags_cache = (True, __import__("time").time())
+    x = _cat_rel(9, 1, "x", category_id=10)
+    y = _cat_rel(10, 2, "y", category_id=20, name="Example 4K")
+    scenario(FakeMovie(tmdb_id="1"), [x, y])
+    _, rel, _ = call()
+    check("lookup error -> tags ignored, the rest of the ranking still applies", rel.id == y.id)
+    VOD["fail"] = False
+    _install_fake_vod(enabled=False)
+
+
+# --------------------------------------------------------------------------- #
+# 1.4.0: per-worker registry behind the Status action
+# --------------------------------------------------------------------------- #
+class FakeRedis:
+    def __init__(self):
+        self.h = {}
+
+    def hset(self, key, field, value):
+        self.h.setdefault(key, {})[field] = value
+
+    def hgetall(self, key):
+        return dict(self.h.get(key, {}))
+
+    def hdel(self, key, field):
+        self.h.get(key, {}).pop(field, None)
+
+
+def test_worker_registry():
+    print("test_worker_registry")
+    import json as _json
+    fake = FakeRedis()
+    orig = (patch._get_redis, patch._process_role, patch._pid_alive)
+    try:
+        patch._get_redis = lambda: fake
+        patch._process_role = lambda: "uwsgi"
+        patch._pid_alive = lambda rec: rec.get("pid") != 4242
+        patch._register_worker(True)
+        rep = patch.worker_report()
+        check("registry readable", rep["available"] is True)
+        check("this worker listed as active", __import__("os").getpid() in rep["active"])
+        # Another (stream) worker recorded inactive, a Celery record, a dead pid, an old record.
+        now = __import__("time").time()
+        fake.hset(patch.WORKERS_REDIS_KEY, "h:777", _json.dumps({"pid": 777, "host": "h", "role": "uwsgi", "active": False, "ts": now}))
+        fake.hset(patch.WORKERS_REDIS_KEY, "h:888", _json.dumps({"pid": 888, "host": "h", "role": "celery", "active": True, "ts": now}))
+        fake.hset(patch.WORKERS_REDIS_KEY, "h:4242", _json.dumps({"pid": 4242, "host": "h", "role": "uwsgi", "active": True, "ts": now}))
+        fake.hset(patch.WORKERS_REDIS_KEY, "h:999", _json.dumps({"pid": 999, "host": "h", "role": "uwsgi", "active": True, "ts": now - patch.WORKER_RECORD_MAX_AGE - 10}))
+        fake.hset(patch.WORKERS_REDIS_KEY, "h:bad", "not json")
+        rep = patch.worker_report()
+        check("inactive stream worker reported", rep["inactive"] == [777])
+        check("celery record not counted as a stream worker", 888 not in rep["active"])
+        check("dead pid not counted", 4242 not in rep["active"])
+        patch._register_worker(True)  # a write prunes dead / old / garbage records
+        fields = set(fake.hgetall(patch.WORKERS_REDIS_KEY))
+        check("write prunes dead, stale and unreadable records",
+              not ({"h:4242", "h:999", "h:bad"} & fields) and {"h:777", "h:888"} <= fields)
+        patch._process_role = lambda: "celery"
+        check("report says where the check ran", patch.worker_report()["here"] == "celery")
+        patch._get_redis = lambda: None
+        check("no Redis -> unavailable, no error", patch.worker_report()["available"] is False)
+        patch._register_worker(True)  # must not raise
+    finally:
+        patch._get_redis, patch._process_role, patch._pid_alive = orig
+
+
 if __name__ == "__main__":
     test_quality_helpers()
     test_cover_image_dims_ignored()
@@ -1047,6 +1466,15 @@ if __name__ == "__main__":
     test_wrapper_falls_back_on_error()
     test_inactive_passes_through()
     test_signature_parity()
+    test_bitrate_reading()
+    test_is_starved()
+    test_parse_floors()
+    test_low_bitrate_ranking()
+    test_bitrate_tiebreak()
+    test_show_pick_honors_bitrate()
+    test_category_tag_absent_changes_nothing()
+    test_category_tag_ranks()
+    test_worker_registry()
     print()
     if _failures:
         print(f"{len(_failures)} check(s) FAILED: {_failures}")
