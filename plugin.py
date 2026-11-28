@@ -81,12 +81,11 @@ def _format_workers(report):
 
 class Plugin:
     name = "VOD Preferences"
-    version = "1.4.0"
+    version = "1.5.0"
     description = (
-        "Greater control over which VOD stream Dispatcharr serves through its "
-        "proxy for a given title: prefer higher video/audio qualities across "
-        "providers, and/or remember a stream selected in the UI as that title's "
-        "durable default."
+        "Greater control over which VOD stream Dispatcharr serves for a given "
+        "title: prefer higher video/audio qualities across providers, remember "
+        "preferred streams for specific titles, and more."
     )
     author = "andyj682"
     help_url = "https://github.com/andyj682/dispatcharr_vod_preferences"
@@ -206,8 +205,69 @@ class Plugin:
             "placeholder": "e.g. tmdb:954  (or a bare tmdb/imdb id)",
             "help_text": (
                 "Type the key of a saved pick here (copy it from 'List saved "
-                "picks'), then click 'Clear one' on the Actions tab. Leave blank "
+                "picks'), then click 'Clear one'. Leave blank "
                 "otherwise."
+            ),
+        },
+        {
+            "id": "avoid_play_number",
+            "label": "Recent play # to avoid",
+            "type": "number",
+            "default": 1,
+            "help_text": (
+                "Which entry from 'List recent plays' the 'Avoid copy' button marks "
+                "as a bad copy (1 = the most recent). TV: avoids that provider for the "
+                "show. Movies: avoids that exact copy. An avoided copy is served "
+                "only if nothing else can play."
+            ),
+        },
+        {
+            "id": "avoid_season_only",
+            "label": "Avoid just that season (TV)",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "When on, a TV avoid rule covers only the season of the episode you "
+                "picked instead of the whole show. Ignored for movies."
+            ),
+        },
+        {
+            "id": "avoid_rule_to_remove",
+            "label": "Avoid rule # to remove",
+            "type": "number",
+            "default": 0,
+            "help_text": "The number shown by 'List avoid rules', for the 'Remove rule' button.",
+        },
+        {
+            "id": "notify_missed_4k",
+            "label": "Notify on missed 4K",
+            "type": "boolean",
+            "default": False,
+            "help_text": (
+                "Send an alert when a title plays below 4K because its only 4K "
+                "copy is Dolby Vision without an HDR/SDR fallback. Needs Prefer 4K "
+                "and the Dolby Vision setting on, plus a Prowl key or webhook "
+                "below. At most one alert per title per day."
+            ),
+        },
+        {
+            "id": "prowl_api_key",
+            "label": "Prowl API key",
+            "type": "string",
+            "input_type": "password",
+            "default": "",
+            "help_text": "Optional. Your Prowl API key (prowlapp.com).",
+        },
+        {
+            "id": "webhook_url",
+            "label": "Webhook URL",
+            "type": "string",
+            "default": "",
+            "placeholder": "https://...",
+            "help_text": (
+                "Optional. Receives a JSON POST with title, message, text and "
+                "content fields (works with Slack/Discord-style webhooks, Home "
+                "Assistant and similar)."
             ),
         },
         {
@@ -216,9 +276,10 @@ class Plugin:
             "type": "info",
             "description": (
                 "Selection order (most specific first): explicit request pick -> "
-                "saved UI pick -> quality rule (avoid DV without fallback -> quality "
-                "tier -> avoid low bitrate -> audio -> bitrate) -> native account "
-                "priority. Use the buttons below to inspect or clear saved picks."
+                "saved UI pick -> avoid DV without fallback -> avoid rules -> "
+                "quality tier -> avoid low bitrate -> audio -> bitrate -> native "
+                "account priority. Use the buttons below to inspect or clear saved "
+                "picks and avoid rules."
             ),
         },
     ]
@@ -243,7 +304,7 @@ class Plugin:
             "id": "clear_title",
             "label": "Clear one saved pick",
             "description": "Remove the saved pick whose key is in the "
-                           "'Title key to clear' box (Settings tab).",
+                           "'Title key to clear' box.",
             "button_label": "Clear one",
             "button_variant": "filled",
         },
@@ -259,6 +320,57 @@ class Plugin:
                 "message": "This permanently removes every remembered per-title "
                            "stream pick. Quality preferences are unaffected.",
             },
+        },
+        {
+            "id": "list_recent",
+            "label": "List recent plays",
+            "description": "Show the last 5 titles the proxy served, with the "
+                           "provider each one played from.",
+            "button_label": "List recent plays",
+            "button_variant": "outline",
+        },
+        {
+            "id": "avoid_recent",
+            "label": "Avoid a recent play",
+            "description": "Mark the copy from 'Recent play # to avoid' as bad, "
+                           "so it is served only as a last resort.",
+            "button_label": "Avoid copy",
+            "button_variant": "filled",
+        },
+        {
+            "id": "list_avoid",
+            "label": "List avoid rules",
+            "description": "Show the copies and providers you've marked to avoid.",
+            "button_label": "List avoid rules",
+            "button_variant": "outline",
+        },
+        {
+            "id": "remove_avoid",
+            "label": "Remove an avoid rule",
+            "description": "Remove the rule numbered in 'Avoid rule # to remove'.",
+            "button_label": "Remove rule",
+            "button_variant": "filled",
+        },
+        {
+            "id": "clear_avoid",
+            "label": "Clear all avoid rules",
+            "description": "Remove every avoid rule.",
+            "button_label": "Clear all",
+            "button_variant": "light",
+            "button_color": "red",
+            "confirm": {
+                "title": "Clear all avoid rules?",
+                "message": "This permanently removes every avoid rule. Saved picks "
+                           "and quality preferences are unaffected.",
+            },
+        },
+        {
+            "id": "test_notify",
+            "label": "Send test notification",
+            "description": "Send a test alert to the Prowl key and/or webhook in "
+                           "Settings.",
+            "button_label": "Send test",
+            "button_variant": "outline",
         },
     ]
 
@@ -294,7 +406,14 @@ class Plugin:
                     f"avoid_dv_no_fallback={settings.get('avoid_dv_no_fallback', False)}, "
                     f"avoid_low_bitrate={settings.get('avoid_low_bitrate', False)} "
                     f"(min Mbps {floor_txt}), "
-                    f"saved_picks={len(_patch.get_saved_picks())}"
+                    f"saved_picks={len(_patch.get_saved_picks())}, "
+                    f"avoid_rules={len(_patch.get_avoid_rules())}, "
+                    f"played_shows={len(_patch.get_played_series())}, "
+                    f"notify_missed_4k={settings.get('notify_missed_4k', False)}"
+                    + (" (no Prowl key or webhook set)"
+                       if settings.get('notify_missed_4k') and not (
+                           str(settings.get('prowl_api_key') or '').strip()
+                           or str(settings.get('webhook_url') or '').strip()) else "")
                 ),
             }
 
@@ -340,6 +459,66 @@ class Plugin:
             except Exception as exc:
                 logger.exception("[VOD-PREF] clear_title failed")
                 return {"status": "error", "message": f"Failed to clear: {exc}"}
+
+        if action == "list_recent":
+            try:
+                rows = _patch.describe_recent_plays()
+            except Exception as exc:
+                logger.exception("[VOD-PREF] list_recent failed")
+                return {"status": "error", "message": f"Failed to list recent plays: {exc}"}
+            return {
+                "status": "ok",
+                "message": _patch.format_recent_plays(rows),
+                "plays": [{k: r[k] for k in ("n", "label", "account", "ago")} for r in rows],
+            }
+
+        if action == "avoid_recent":
+            settings = context.get("settings", {})
+            number = settings.get("avoid_play_number", params.get("play", 1))
+            season_only = _patch._as_bool(settings.get("avoid_season_only", False), False)
+            try:
+                res = _patch.add_avoid_from_recent(number, season_only)
+            except Exception as exc:
+                logger.exception("[VOD-PREF] avoid_recent failed")
+                return {"status": "error", "message": f"Failed to add avoid rule: {exc}"}
+            return {"status": "ok" if res["ok"] else "error", "message": res["message"]}
+
+        if action == "list_avoid":
+            rules = _patch.get_avoid_rules()
+            return {"status": "ok", "message": _patch.format_avoid_rules(rules), "rules": rules}
+
+        if action == "remove_avoid":
+            settings = context.get("settings", {})
+            number = settings.get("avoid_rule_to_remove", params.get("rule", 0))
+            try:
+                res = _patch.remove_avoid_rule(number)
+            except Exception as exc:
+                logger.exception("[VOD-PREF] remove_avoid failed")
+                return {"status": "error", "message": f"Failed to remove avoid rule: {exc}"}
+            return {"status": "ok" if res["ok"] else "error", "message": res["message"]}
+
+        if action == "clear_avoid":
+            try:
+                removed = _patch.clear_all_avoid()
+                return {"status": "ok", "message": f"Cleared {removed} avoid rule(s)."}
+            except Exception as exc:
+                logger.exception("[VOD-PREF] clear_avoid failed")
+                return {"status": "error", "message": f"Failed to clear: {exc}"}
+
+        if action == "test_notify":
+            settings = context.get("settings", {})
+            prowl = str(settings.get("prowl_api_key") or "").strip()
+            hook = str(settings.get("webhook_url") or "").strip()
+            if not prowl and not hook:
+                return {"status": "error",
+                        "message": "Enter a Prowl API key and/or a webhook URL first."}
+            results = _patch.send_notification(
+                prowl, hook, "VOD Preferences test",
+                "Test alert from VOD Preferences. Missed-4K alerts will look like this.")
+            summary = ", ".join(f"{ch}: {'sent' if ok else 'FAILED'} ({detail})"
+                                for ch, ok, detail in results)
+            all_ok = bool(results) and all(ok for _c, ok, _d in results)
+            return {"status": "ok" if all_ok else "error", "message": summary}
 
         return {"status": "error", "message": f"Unknown action: {action}"}
 

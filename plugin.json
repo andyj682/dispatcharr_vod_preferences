@@ -1,7 +1,7 @@
 {
   "name": "VOD Preferences",
-  "version": "1.4.0",
-  "description": "Greater control over which VOD stream Dispatcharr serves through its proxy for a given title: prefer higher video/audio qualities across providers, and/or remember a stream selected in the UI as that title's durable default.",
+  "version": "1.5.0",
+  "description": "Greater control over which VOD stream Dispatcharr serves for a given title: prefer higher video/audio qualities across providers, remember preferred streams for specific titles, and more.",
   "author": "andyj682",
   "help_url": "https://github.com/andyj682/dispatcharr_vod_preferences",
   "fields": [
@@ -92,13 +92,57 @@
       "type": "string",
       "default": "",
       "placeholder": "e.g. tmdb:954  (or a bare tmdb/imdb id)",
-      "help_text": "Type the key of a saved pick here (copy it from 'List saved picks'), then click 'Clear one' on the Actions tab. Leave blank otherwise."
+      "help_text": "Type the key of a saved pick here (copy it from 'List saved picks'), then click 'Clear one'. Leave blank otherwise."
+    },
+    {
+      "id": "avoid_play_number",
+      "label": "Recent play # to avoid",
+      "type": "number",
+      "default": 1,
+      "help_text": "Which entry from 'List recent plays' the 'Avoid copy' button marks as a bad copy (1 = the most recent). TV: avoids that provider for the show. Movies: avoids that exact copy. An avoided copy is served only if nothing else can play."
+    },
+    {
+      "id": "avoid_season_only",
+      "label": "Avoid just that season (TV)",
+      "type": "boolean",
+      "default": false,
+      "help_text": "When on, a TV avoid rule covers only the season of the episode you picked instead of the whole show. Ignored for movies."
+    },
+    {
+      "id": "avoid_rule_to_remove",
+      "label": "Avoid rule # to remove",
+      "type": "number",
+      "default": 0,
+      "help_text": "The number shown by 'List avoid rules', for the 'Remove rule' button."
+    },
+    {
+      "id": "notify_missed_4k",
+      "label": "Notify on missed 4K",
+      "type": "boolean",
+      "default": false,
+      "help_text": "Send an alert when a title plays below 4K because its only 4K copy is Dolby Vision without an HDR/SDR fallback. Needs Prefer 4K and the Dolby Vision setting on, plus a Prowl key or webhook below. At most one alert per title per day."
+    },
+    {
+      "id": "prowl_api_key",
+      "label": "Prowl API key",
+      "type": "string",
+      "input_type": "password",
+      "default": "",
+      "help_text": "Optional. Your Prowl API key (prowlapp.com)."
+    },
+    {
+      "id": "webhook_url",
+      "label": "Webhook URL",
+      "type": "string",
+      "default": "",
+      "placeholder": "https://...",
+      "help_text": "Optional. Receives a JSON POST with title, message, text and content fields (works with Slack/Discord-style webhooks, Home Assistant and similar)."
     },
     {
       "id": "_info",
       "label": "",
       "type": "info",
-      "description": "Selection order (most specific first): explicit request pick -> saved UI pick -> quality rule (avoid DV without fallback -> quality tier -> avoid low bitrate -> audio -> bitrate) -> native account priority. Use the buttons below to inspect or clear saved picks."
+      "description": "Selection order (most specific first): explicit request pick -> saved UI pick -> avoid DV without fallback -> avoid rules -> quality tier -> avoid low bitrate -> audio -> bitrate -> native account priority. Use the buttons below to inspect or clear saved picks and avoid rules."
     }
   ],
   "actions": [
@@ -119,7 +163,7 @@
     {
       "id": "clear_title",
       "label": "Clear one saved pick",
-      "description": "Remove the saved pick whose key is in the 'Title key to clear' box (Settings tab).",
+      "description": "Remove the saved pick whose key is in the 'Title key to clear' box.",
       "button_label": "Clear one",
       "button_variant": "filled"
     },
@@ -134,6 +178,53 @@
         "title": "Clear all saved picks?",
         "message": "This permanently removes every remembered per-title stream pick. Quality preferences are unaffected."
       }
+    },
+    {
+      "id": "list_recent",
+      "label": "List recent plays",
+      "description": "Show the last 5 titles the proxy served, with the provider each one played from.",
+      "button_label": "List recent plays",
+      "button_variant": "outline"
+    },
+    {
+      "id": "avoid_recent",
+      "label": "Avoid a recent play",
+      "description": "Mark the copy from 'Recent play # to avoid' as bad, so it is served only as a last resort.",
+      "button_label": "Avoid copy",
+      "button_variant": "filled"
+    },
+    {
+      "id": "list_avoid",
+      "label": "List avoid rules",
+      "description": "Show the copies and providers you've marked to avoid.",
+      "button_label": "List avoid rules",
+      "button_variant": "outline"
+    },
+    {
+      "id": "remove_avoid",
+      "label": "Remove an avoid rule",
+      "description": "Remove the rule numbered in 'Avoid rule # to remove'.",
+      "button_label": "Remove rule",
+      "button_variant": "filled"
+    },
+    {
+      "id": "clear_avoid",
+      "label": "Clear all avoid rules",
+      "description": "Remove every avoid rule.",
+      "button_label": "Clear all",
+      "button_variant": "light",
+      "button_color": "red",
+      "confirm": {
+        "title": "Clear all avoid rules?",
+        "message": "This permanently removes every avoid rule. Saved picks and quality preferences are unaffected."
+      }
+    },
+    {
+      "id": "test_notify",
+      "label": "Send test notification",
+      "description": "Send a test alert to the Prowl key and/or webhook in Settings.",
+      "button_label": "Send test",
+      "button_variant": "outline"
     }
   ]
 }

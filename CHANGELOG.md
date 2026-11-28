@@ -5,6 +5,62 @@ All notable changes to this project are documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-11-27
+
+### Added
+
+- **Avoid a bad copy.** Mark a copy that plays badly (out-of-sync audio, the
+  wrong cut, burned-in subtitles and so on) so it's served only if nothing else
+  plays. Pick it from **List recent plays** (the last 5 titles the proxy served,
+  with the provider each came from) and click **Avoid copy**.
+  - TV: avoids that provider for the whole show, or only that season with
+    **Avoid just that season (TV)**.
+  - Movies: avoids that exact copy.
+  - Demotes, never removes: the copy stays at the end of the failover list.
+  - Ranks below **Avoid Dolby Vision without HDR/SDR fallback** (a bad copy still
+    beats one that won't play properly) and above the quality rule.
+  - An explicit pick (a UI play or a saved pick) still wins. Adding a rule removes
+    a saved pick that chose the same copy or provider.
+  - **List avoid rules**, **Remove rule** and **Clear all avoid rules** to
+    manage them. Rules live in their own database row and survive a plugin
+    delete, like saved picks.
+- **Played-shows record** for other plugins: a durable database row
+  (`dispatcharr_vod_preferences_played`) listing which shows were watched in the
+  last 60 days, the latest episode played and the furthest one reached. Written
+  once per new episode play. Lets an enrichment or pre-conversion plugin focus on
+  the next episodes of shows actually being watched. Format documented in the
+  README.
+- **Missed-4K alert** (opt-in). A Prowl and/or webhook notification when a title
+  plays below 4K because its only 4K copy is Dolby Vision without an HDR/SDR
+  fallback. At most one per title per day (de-duplicated across workers), sent in
+  the background with a 5-second timeout, never for a copy you chose yourself.
+  **Send test** checks the setup.
+
+### Changed
+
+- Shorter plugin description on the Plugins page.
+- **Check status** also reports the number of avoid rules and played shows, and
+  whether the alert is on (and warns when it's on with nowhere to send).
+- `tools/rank_dryrun.sh` marks candidates an avoid rule covers (`AVOIDED`) and
+  ranks with them, and shows each copy's codec next to its bitrate (plus the
+  actual bitrate when a codec credit applies, e.g. `bitrate=2.34 (hevc 1.56 actual)`).
+
+### Fixed
+
+- `tools/rank_dryrun.sh` and `tools/wanted_survey.sh` no longer leave a
+  root-owned `__pycache__` folder inside the installed plugin. They run as root
+  through `docker exec`, and that leftover folder could make the next plugin
+  import from the UI fail with "Failed to back up existing plugin: Permission
+  denied".
+
+### Tests
+
+- 85 new checks (272 total): avoid-rule matching (shows, seasons, movie copies,
+  other titles), ranking placement against DV-avoidance, quality and explicit
+  picks, recent-play recording, adding/removing rules, popup length, the alert's
+  conditions and de-duplication, the notification sender, and the played-shows
+  record (latest vs furthest episode, pruning, repeat plays, failures).
+
 ## [1.4.0] - 2026-11-27
 
 ### Added
@@ -242,6 +298,7 @@ Initial release.
   so the plugin can only choose among the streams Dispatcharr currently knows
   about; refresh a series to surface newly-added streams. Movies are unaffected.
 
+[1.5.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.5.0
 [1.4.0]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.4.0
 [1.3.3]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.3
 [1.3.2]: https://github.com/andyj682/dispatcharr_vod_preferences/releases/tag/v1.3.2

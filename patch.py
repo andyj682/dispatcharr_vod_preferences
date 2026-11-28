@@ -88,6 +88,7 @@ import os
 import re
 import threading
 import time
+import types
 
 logger = logging.getLogger("plugins.dispatcharr_vod_preferences")
 
@@ -184,6 +185,47 @@ _CAT_TIER_ATTR = "_vodpref_category_tier"
 WORKERS_REDIS_KEY = "dispatcharr_vod_preferences:workers"
 WORKER_RECORD_MAX_AGE = 14 * 86400   # prune records older than this on write
 
+# Recent plays (Redis list, newest first): the last few DISTINCT titles the proxy
+# served, so the user can point an avoid rule at "the copy that just played" --
+# from a player they can't see which provider or stream that was. Kept short on
+# purpose: the list is shown in a small action-result popup.
+RECENT_REDIS_KEY = "dispatcharr_vod_preferences:recent"
+RECENT_MAX = 5
+# A repeat of the newest entry (same title AND copy) inside this window is the
+# same play (players re-request; Dispatcharr 0.34 calls the hook twice per first
+# request) and isn't re-recorded.
+RECENT_REPEAT_SECONDS = 600
+RECENT_LABEL_CHARS = 26   # title truncation in the popup
+
+# Played shows (a PUBLIC, durable record other plugins may read -- e.g. VOD Merge
+# & Enrich narrowing episode enrichment to shows actually being watched). One
+# CoreSettings row, value:
+#   {"version": 1, "series": {"<Series.id>": {"ts": <unix>, "season": n,
+#     "episode": n, "episode_id": <Episode.id>, "max_season": n, "max_episode": n}}}
+# season/episode = the latest episode played; max_* = the furthest one reached.
+# Written once per NEW episode play (repeats of the same play are skipped), and
+# entries older than PLAYED_RETENTION_DAYS are pruned on write. A DB row rather
+# than Redis because Dispatcharr's Redis isn't persisted across container restarts.
+PLAYED_CORE_KEY = "dispatcharr_vod_preferences_played"
+PLAYED_CORE_NAME = "Dispatcharr VOD Preferences - played shows"
+PLAYED_FORMAT_VERSION = 1
+PLAYED_RETENTION_DAYS = 60
+
+# Avoid rules live in their own CoreSettings row (same reason as the picks row:
+# the Plugins UI round-trips PluginConfig.settings). Value = {"rules": [...]}.
+AVOID_CORE_KEY = "dispatcharr_vod_preferences_avoid"
+AVOID_CORE_NAME = "Dispatcharr VOD Preferences - avoid rules"
+MAX_AVOID_RULES = 1000
+AVOID_LIST_SHOWN = 8      # newest rules shown by 'List avoid rules'
+
+# "Missed 4K" notification.
+DEFAULT_NOTIFY_MISSED_4K = False
+NOTIFY_DEDUPE_PREFIX = "dispatcharr_vod_preferences:notified:"
+NOTIFY_DEDUPE_SECONDS = 86400   # at most one alert per title per day
+NOTIFY_TIMEOUT_SECONDS = 5.0
+PROWL_URL = "https://api.prowlapp.com/publicapi/add"
+NOTIFY_APP_NAME = "Dispatcharr"
+
 # Quality-token patterns, checked most-specific-first so "UHD"/"FHD" resolve
 # before the plain "HD" of the 720p tier. Each token must be bounded by a
 # non-alphanumeric (or string edge) so free-text names don't misfire -- e.g.
@@ -239,6 +281,16 @@ _cfg_cache_ts = 0.0
 # Cached answer to "does any category carry a quality tag?" -> (bool, ts).
 _cat_tags_lock = threading.Lock()
 _cat_tags_cache = None
+
+# Last play seen by THIS process, for repeat detection when Redis is down.
+_last_play_local = {}
+
+# Fallback notification dedupe when Redis is unavailable: {title_key: ts}.
+_notified_local = {}
+
+# Replaceable for tests: the function that actually performs a notification
+# send in the background (see _notify_async).
+_notify_sender = None
 
 
 # --------------------------------------------------------------------------- #
@@ -984,6 +1036,40 @@ def _write_picks(mutate) -> int:
     return count
 
 
+def _read_avoid_from_db() -> list:
+    """The avoid-rule list from its CoreSettings row ([] when absent)."""
+    from core.models import CoreSettings
+    row = CoreSettings.objects.filter(key=AVOID_CORE_KEY).values("value").first()
+    val = (row or {}).get("value")
+    rules = val.get("rules") if isinstance(val, dict) else None
+    return [r for r in rules if isinstance(r, dict)] if isinstance(rules, list) else []
+
+
+def _write_avoid(mutate) -> list:
+    """Apply *mutate(rules_list)* to the avoid row under a lock (creating it on
+    first write). *mutate* edits the list in place and returns True if it changed
+    anything. Returns the resulting list."""
+    from django.db import transaction
+    from core.models import CoreSettings
+
+    with transaction.atomic():
+        row = CoreSettings.objects.select_for_update().filter(key=AVOID_CORE_KEY).first()
+        if row is None:
+            rules = []
+            if mutate(rules):
+                CoreSettings.objects.create(
+                    key=AVOID_CORE_KEY, name=AVOID_CORE_NAME, value={"rules": rules}
+                )
+        else:
+            val = row.value if isinstance(row.value, dict) else {}
+            rules = [r for r in (val.get("rules") or []) if isinstance(r, dict)]
+            if mutate(rules):
+                row.value = {"rules": rules}
+                row.save(update_fields=["value"])
+    invalidate_config_cache()
+    return rules
+
+
 def _parse_floors(settings) -> dict:
     """{tier: Mbps} from the min_bitrate_* settings. Blank/invalid -> the default;
     0 or negative -> no minimum for that tier (omitted)."""
@@ -1025,6 +1111,11 @@ def _load_config(force: bool = False) -> dict:
     except Exception as exc:
         logger.debug("[VOD-PREF] picks read failed (%s); treating as empty", exc)
         picks = {}
+    try:
+        avoid_rules = _read_avoid_from_db()
+    except Exception as exc:
+        logger.debug("[VOD-PREF] avoid rules read failed (%s); treating as none", exc)
+        avoid_rules = []
 
     cfg = {
         "prefer_quality": settings.get("prefer_quality", DEFAULT_PREFER_QUALITY) or "off",
@@ -1046,6 +1137,13 @@ def _load_config(force: bool = False) -> dict:
         ),
         "min_bitrate": _parse_floors(settings),
         "saved_picks": picks if isinstance(picks, dict) else {},
+        "avoid_rules": avoid_rules,
+        "notify_missed_4k": _as_bool(
+            settings.get("notify_missed_4k", DEFAULT_NOTIFY_MISSED_4K),
+            DEFAULT_NOTIFY_MISSED_4K,
+        ),
+        "prowl_api_key": str(settings.get("prowl_api_key") or "").strip(),
+        "webhook_url": str(settings.get("webhook_url") or "").strip(),
     }
     with _cfg_lock:
         _cfg_cache = cfg
@@ -1175,11 +1273,76 @@ def _log_label(content_obj, relation):
     return f"as:{relation.m3u_account_id}:{relation.stream_id}"
 
 
-def _quality_ranked(candidates, prefer, use_audio=False, avoid_dv=False, floors=None):
+def _rule_season(rule):
+    try:
+        return int(rule.get("season")) if rule.get("season") is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _avoided_ids(content_obj, candidates, rules) -> set:
+    """Relation ids of the candidates an avoid rule covers for this title.
+
+    Episode rules name a PROVIDER for a show (optionally one season), keyed like
+    a show-level saved pick (_series_key). Movie rules name one exact copy
+    (account + stream) of a title. The series lookup is only paid when at least
+    one episode rule exists.
+    """
+    if not rules or not candidates:
+        return set()
+    if _is_episode(content_obj):
+        ep_rules = [r for r in rules if r.get("kind") == "episode"]
+        if not ep_rules:
+            return set()
+        sk = _series_key(content_obj)
+        if sk is None:
+            return set()
+        try:
+            season = int(getattr(content_obj, "season_number", None))
+        except (TypeError, ValueError):
+            season = None
+        accts = set()
+        for r in ep_rules:
+            if r.get("key") != sk:
+                continue
+            rs = _rule_season(r)
+            if rs is not None and rs != season:
+                continue
+            accts.add(r.get("acct"))
+        return {c.id for c in candidates if c.m3u_account_id in accts}
+    mv_rules = [r for r in rules if r.get("kind") == "movie"]
+    if not mv_rules:
+        return set()
+    title_keys = set(_title_level_keys(content_obj))
+    out = set()
+    for c in candidates:
+        for r in mv_rules:
+            if (c.m3u_account_id == r.get("acct") and str(c.stream_id) == str(r.get("stream"))
+                    and (r.get("key") in title_keys or r.get("key") == _stream_fallback_key(c))):
+                out.add(c.id)
+                break
+    return out
+
+
+def _demote(candidates, avoided):
+    """Candidates with the avoided ones moved to the end (both halves keep order)."""
+    if not avoided:
+        return list(candidates)
+    return ([c for c in candidates if c.id not in avoided]
+            + [c for c in candidates if c.id in avoided])
+
+
+def _quality_ranked(candidates, prefer, use_audio=False, avoid_dv=False, floors=None,
+                    avoided=None):
     """Stable-sort candidates (best first) by a composite key.
 
-    Key = (compatible, quality_rank, not_starved, audio_rank, bitrate_bucket),
-    all higher-is-better:
+    Key = (compatible, not_avoided, quality_rank, not_starved, audio_rank,
+    bitrate_bucket), all higher-is-better:
+      * not_avoided -- (second) a copy an avoid rule covers scores 0, so it ranks
+        after every other PLAYABLE copy (it stays in the failover list). It sits
+        below `compatible` because an avoid rule means "anything else that
+        plays", and a no-fallback DV copy doesn't play properly where that
+        setting is on.
       * compatible -- when *avoid_dv* is on, a Dolby-Vision-without-fallback
         stream scores 0 and everything else 1, so a PLAYABLE stream outranks a
         no-fallback DV stream even of higher resolution. Off -> all 1 (no effect).
@@ -1197,10 +1360,12 @@ def _quality_ranked(candidates, prefer, use_audio=False, avoid_dv=False, floors=
     quality_on = bool(prefer) and prefer != "off"
     priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"]) if quality_on else None
     use_bitrate = quality_on and floors is not None
+    avoided = avoided or ()
     return sorted(
         candidates,
         key=lambda c: (
             0 if (avoid_dv and _is_dv_no_fallback(c)) else 1,
+            0 if c.id in avoided else 1,
             quality_rank(c, priority) if priority else 0,
             0 if (use_bitrate and is_starved(c, floors)) else 1,
             audio_rank(c) if (quality_on and use_audio) else 0,
@@ -1210,16 +1375,18 @@ def _quality_ranked(candidates, prefer, use_audio=False, avoid_dv=False, floors=
     )
 
 
-def _finalize_show_pick(chosen, candidates, prefer, use_audio=False, avoid_dv=False, floors=None):
+def _finalize_show_pick(chosen, candidates, prefer, use_audio=False, avoid_dv=False, floors=None,
+                        avoided=None):
     """A TV show pick names a PROVIDER (account). Keep that provider, but still
     honour the quality rule and DV-avoidance WITHIN it -- so when one provider
     carries both the 4K and non-4K copy of an episode, Prefer 4K picks the 4K
     stream, and a compatible copy is preferred over a no-fallback DV one. Fail
-    over to other providers (native order) only if the chosen provider can't serve it.
+    over to other providers (native order, avoided ones last) only if the chosen
+    provider can't serve it. An explicit pick outranks an avoid rule.
     """
     acct = chosen.m3u_account_id
     same = [c for c in candidates if c.m3u_account_id == acct]
-    other = [c for c in candidates if c.m3u_account_id != acct]
+    other = _demote([c for c in candidates if c.m3u_account_id != acct], avoided)
     if same and ((prefer and prefer != "off") or avoid_dv):
         same = _quality_ranked(same, prefer, use_audio, avoid_dv, floors)
     primary = same[0] if same else chosen
@@ -1254,41 +1421,330 @@ def _apply_preferences(content_obj, relation, candidates,
     if quality_on:
         _annotate_category_tiers(candidates)
 
+    # Avoid rules (user-marked bad copies). They DEMOTE -- an avoided copy ranks
+    # after every other copy but stays in the failover list, so a title whose
+    # only copies are avoided still plays. A lookup failure means "no rules".
+    try:
+        avoided = _avoided_ids(content_obj, candidates, cfg.get("avoid_rules"))
+    except Exception as exc:
+        logger.debug("[VOD-PREF] avoid-rule lookup failed: %s", exc)
+        avoided = set()
+
     # 2. Saved UI pick for this title. Movies pin the exact stream; TV pins the
     #    provider for the whole series and still honours the quality rule within it.
+    #    An explicit pick outranks an avoid rule; the failover tail still demotes.
     if remember:
         chosen = _lookup_saved(content_obj, candidates, cfg["saved_picks"])
         if chosen is not None:
             if _is_episode(content_obj):
                 primary, ordered = _finalize_show_pick(chosen, candidates, prefer, use_audio,
-                                                       avoid_dv, floors)
+                                                       avoid_dv, floors, avoided)
             else:
-                primary, ordered = chosen, _front(candidates, chosen)
+                primary, ordered = chosen, _front(_demote(candidates, avoided), chosen)
             return primary, ordered, "saved-pick"
 
-    # 3. Quality rule and/or Dolby-Vision avoidance. Both re-order candidates;
-    #    DV-avoidance (when on) is the TOP sort key, so a playable stream beats a
-    #    no-fallback DV one even at higher resolution, while the quality rule and
-    #    audio tiebreak order the rest. Audio can also decide when there's no
-    #    video signal but an audio one is present; otherwise a no-signal quality
-    #    result (and a DV-avoidance that changed nothing) falls through to native.
-    if quality_on or avoid_dv:
+    # 3. Dolby-Vision avoidance, avoid rules, then the quality rule. All
+    #    re-order candidates. DV-avoidance (when on) is the TOP sort key, so a
+    #    playable stream beats a no-fallback DV one even at higher resolution;
+    #    avoid rules come next (a user-marked bad copy still beats one that won't
+    #    play properly); the quality rule and audio tiebreak order the rest.
+    #    Audio can also decide when there's no video signal but an audio one is
+    #    present; otherwise a no-signal quality result (and a DV-avoidance that
+    #    changed nothing) keeps native order (avoided copies still moved last).
+    if quality_on or avoid_dv or avoided:
         priority = _QUALITY_PRIORITY.get(prefer, _QUALITY_PRIORITY["4k"]) if quality_on else None
-        ranked = _quality_ranked(candidates, prefer, use_audio, avoid_dv, floors)
+        ranked = _quality_ranked(candidates, prefer, use_audio, avoid_dv, floors, avoided)
         top = ranked[0] if ranked else None
         if top is not None:
             has_quality = quality_on and quality_rank(top, priority) > 0
             has_audio = quality_on and use_audio and audio_rank(top) > 0
-            avoided = avoid_dv and _is_dv_no_fallback(relation) and not _is_dv_no_fallback(top)
+            dv_moved = avoid_dv and _is_dv_no_fallback(relation) and not _is_dv_no_fallback(top)
+            rule_moved = relation.id in avoided and top.id not in avoided
             if has_quality or has_audio:
                 return top, ranked, "quality:%s" % prefer
-            if avoided:
+            if dv_moved:
                 return top, ranked, "avoid-dv"
+            if rule_moved:
+                return top, ranked, "avoid-rule"
+        base = _demote(candidates, avoided)
         if quality_on:
-            return relation, candidates, "quality:%s:no-signal" % prefer
+            return relation, base, "quality:%s:no-signal" % prefer
+        if avoided:
+            return relation, base, "avoid-rule:failover"
 
     # 4. Native.
     return relation, candidates, "native"
+
+
+# --------------------------------------------------------------------------- #
+# Recent plays (for avoid rules) -- request path, best effort
+# --------------------------------------------------------------------------- #
+
+def _recent_entry(content_type, content_obj, relation):
+    cid = getattr(content_obj, "id", None)
+    if cid is None or relation is None:
+        return None
+    kind = "episode" if _is_episode(content_obj) else "movie"
+    return {"type": kind, "cid": cid, "acct": relation.m3u_account_id,
+            "stream": str(relation.stream_id), "ts": time.time()}
+
+
+def _same_play(a, b) -> bool:
+    """b is a repeat of a: same title and copy, within RECENT_REPEAT_SECONDS."""
+    try:
+        return ((a.get("type"), a.get("cid"), a.get("acct"), a.get("stream"))
+                == (b["type"], b["cid"], b["acct"], b["stream"])
+                and b["ts"] - float(a.get("ts") or 0) < RECENT_REPEAT_SECONDS)
+    except Exception:
+        return False
+
+
+def _record_recent_play(content_type, content_obj, relation) -> bool:
+    """Push the copy just served onto the recent-plays list. Never raises.
+
+    Distinct TITLES: a newer play of a title replaces its older entry. A repeat
+    of the newest entry (same title and copy within RECENT_REPEAT_SECONDS) is the
+    same play and costs one Redis read. Returns True for a NEW play (the
+    played-shows record is only written then); without Redis, repeats are
+    detected per process.
+    """
+    try:
+        entry = _recent_entry(content_type, content_obj, relation)
+        if entry is None:
+            return False
+        r = _get_redis()
+        if r is None:
+            prev = _last_play_local.get("last")
+            _last_play_local["last"] = entry
+            return not (prev and _same_play(prev, entry))
+        old = []
+        for raw in r.lrange(RECENT_REDIS_KEY, 0, RECENT_MAX) or []:
+            rec = _parse_worker_record(raw)
+            if rec is not None:
+                old.append(rec)
+        if old and _same_play(old[0], entry):
+            return False
+        keep = [entry] + [e for e in old
+                          if (e.get("type"), e.get("cid")) != (entry["type"], entry["cid"])]
+        pipe = r.pipeline()
+        pipe.delete(RECENT_REDIS_KEY)
+        pipe.rpush(RECENT_REDIS_KEY, *[json.dumps(e) for e in keep[:RECENT_MAX]])
+        pipe.execute()
+        return True
+    except Exception as exc:
+        logger.debug("[VOD-PREF] recent-play record failed: %s", exc)
+        return False
+
+
+def _record_played_series(content_obj) -> None:
+    """Update the durable played-shows record for an episode play. Never raises."""
+    try:
+        if not _is_episode(content_obj):
+            return
+        sid = getattr(content_obj, "series_id", None)
+        if sid is None:
+            sid = getattr(getattr(content_obj, "series", None), "id", None)
+        if sid is None:
+            return
+        season = int(getattr(content_obj, "season_number", None) or 0)
+        episode = int(getattr(content_obj, "episode_number", None) or 0)
+        now = time.time()
+
+        def _mutate(series):
+            prev = series.get(str(sid)) if isinstance(series.get(str(sid)), dict) else {}
+            furthest = max((int(prev.get("max_season", -1)), int(prev.get("max_episode", -1))),
+                           (season, episode))
+            series[str(sid)] = {
+                "ts": now, "season": season, "episode": episode,
+                "episode_id": getattr(content_obj, "id", None),
+                "max_season": furthest[0], "max_episode": furthest[1],
+            }
+            cutoff = now - PLAYED_RETENTION_DAYS * 86400
+            for k in [k for k, v in series.items()
+                      if not isinstance(v, dict) or float(v.get("ts") or 0) < cutoff]:
+                del series[k]
+            return True
+
+        _write_played(_mutate)
+    except Exception as exc:
+        logger.debug("[VOD-PREF] played-shows record failed: %s", exc)
+
+
+def _write_played(mutate) -> dict:
+    """Apply *mutate(series_dict)* to the played-shows row under a lock."""
+    from django.db import transaction
+    from core.models import CoreSettings
+
+    with transaction.atomic():
+        row = CoreSettings.objects.select_for_update().filter(key=PLAYED_CORE_KEY).first()
+        val = (row.value if row is not None and isinstance(row.value, dict) else {}) or {}
+        series = dict(val.get("series") or {}) if isinstance(val.get("series"), dict) else {}
+        if not mutate(series):
+            return series
+        new_val = {"version": PLAYED_FORMAT_VERSION, "series": series}
+        if row is None:
+            CoreSettings.objects.create(key=PLAYED_CORE_KEY, name=PLAYED_CORE_NAME, value=new_val)
+        else:
+            row.value = new_val
+            row.save(update_fields=["value"])
+    return series
+
+
+def get_played_series() -> dict:
+    """{series_id(str): record} from the played-shows row ({} when absent)."""
+    try:
+        from core.models import CoreSettings
+        row = CoreSettings.objects.filter(key=PLAYED_CORE_KEY).values("value").first()
+        val = (row or {}).get("value")
+        series = val.get("series") if isinstance(val, dict) else None
+        return dict(series) if isinstance(series, dict) else {}
+    except Exception as exc:
+        logger.debug("[VOD-PREF] played-shows read failed: %s", exc)
+        return {}
+
+
+def get_recent_plays() -> list:
+    """The recent-plays entries, newest first ([] when unavailable)."""
+    r = _get_redis()
+    if r is None:
+        return []
+    out = []
+    for raw in r.lrange(RECENT_REDIS_KEY, 0, RECENT_MAX - 1) or []:
+        rec = _parse_worker_record(raw)
+        if rec is not None:
+            out.append(rec)
+    return out
+
+
+# --------------------------------------------------------------------------- #
+# "Missed 4K" notification -- request path decides, a background thread sends
+# --------------------------------------------------------------------------- #
+
+def _is_missed_4k(cfg, reason, chosen, candidates) -> bool:
+    """True when the plugin served a non-4K copy because every 4K copy is Dolby
+    Vision without an HDR/SDR fallback (Profile 5) -- i.e. DV avoidance cost the
+    viewer 4K. Explicit picks (request or saved) are the user's own choice and
+    never alert."""
+    if not (cfg.get("notify_missed_4k") and cfg.get("avoid_dv_no_fallback")
+            and cfg.get("prefer_quality") == "4k"):
+        return False
+    if reason in ("request-pick", "saved-pick", "native"):
+        return False
+    if quality_tier(chosen) == "4k":
+        return False
+    four_k = [c for c in candidates if quality_tier(c) == "4k"]
+    return bool(four_k) and all(_is_dv_no_fallback(c) for c in four_k)
+
+
+def _content_label(content_obj) -> str:
+    """'Show Name S02E03' / 'Movie Name (2021)'. May query the series (episodes);
+    only called when an alert actually fires."""
+    if _is_episode(content_obj):
+        series = getattr(content_obj, "series", None)
+        name = getattr(series, "name", None) or "Unknown show"
+        try:
+            return "%s S%02dE%02d" % (name, int(content_obj.season_number or 0),
+                                      int(content_obj.episode_number or 0))
+        except (TypeError, ValueError):
+            return str(name)
+    name = getattr(content_obj, "name", None) or "Unknown movie"
+    year = getattr(content_obj, "year", None)
+    return "%s (%s)" % (name, year) if year else str(name)
+
+
+def _account_name(relation) -> str:
+    acct = getattr(relation, "m3u_account", None)
+    return getattr(acct, "name", None) or "account %s" % relation.m3u_account_id
+
+
+def _claim_notification(dedupe_key) -> bool:
+    """True if this process may send the alert for *dedupe_key* (first in the
+    window). Redis SET NX across workers; an in-process dict without Redis."""
+    r = _get_redis()
+    if r is not None:
+        try:
+            return bool(r.set(NOTIFY_DEDUPE_PREFIX + dedupe_key, "1",
+                              nx=True, ex=int(NOTIFY_DEDUPE_SECONDS)))
+        except Exception:
+            pass
+    now = time.time()
+    last = _notified_local.get(dedupe_key)
+    if last is not None and now - last < NOTIFY_DEDUPE_SECONDS:
+        return False
+    _notified_local[dedupe_key] = now
+    return True
+
+
+def send_notification(prowl_api_key, webhook_url, title, message) -> list:
+    """Send *title*/*message* to Prowl and/or a webhook. Blocking, short timeout,
+    never raises. Returns [(channel, ok, detail), ...] (empty if none configured).
+
+    The webhook receives a JSON POST: {"event", "title", "message", "text",
+    "content"} -- `text`/`content` let Slack/Discord/Mattermost-style webhooks
+    show it as-is.
+    """
+    results = []
+    if not prowl_api_key and not webhook_url:
+        return results
+    try:
+        import requests
+    except Exception as exc:
+        return [("setup", False, "requests unavailable: %s" % exc)]
+    if prowl_api_key:
+        try:
+            resp = requests.post(PROWL_URL, data={
+                "apikey": prowl_api_key, "application": NOTIFY_APP_NAME,
+                "event": title, "description": message,
+            }, timeout=NOTIFY_TIMEOUT_SECONDS)
+            ok = resp.status_code == 200
+            results.append(("prowl", ok, "HTTP %s" % resp.status_code))
+        except Exception as exc:
+            results.append(("prowl", False, type(exc).__name__))
+    if webhook_url:
+        try:
+            full = "%s: %s" % (title, message)
+            resp = requests.post(webhook_url, json={
+                "event": "missed_4k" if title == "Missed 4K" else "vod_preferences",
+                "title": title, "message": message, "text": full, "content": full,
+            }, timeout=NOTIFY_TIMEOUT_SECONDS)
+            ok = 200 <= resp.status_code < 300
+            results.append(("webhook", ok, "HTTP %s" % resp.status_code))
+        except Exception as exc:
+            results.append(("webhook", False, type(exc).__name__))
+    for channel, ok, detail in results:
+        if not ok:
+            logger.warning("[VOD-PREF] %s notification failed (%s)", channel, detail)
+    return results
+
+
+def _notify_async(cfg, title, message) -> None:
+    """Send in a daemon thread (a greenlet under Dispatcharr's gevent uWSGI), so
+    the stream request never waits on a notification service."""
+    sender = _notify_sender or send_notification
+    args = (cfg.get("prowl_api_key"), cfg.get("webhook_url"), title, message)
+    t = threading.Thread(target=sender, args=args, daemon=True,
+                         name="vodpref-notify")
+    t.start()
+
+
+def _maybe_notify_missed_4k(cfg, reason, content_type, content_obj, chosen, candidates) -> None:
+    """Fire the 'missed 4K' alert when it applies. Never raises."""
+    try:
+        if not (cfg.get("prowl_api_key") or cfg.get("webhook_url")):
+            return
+        if not _is_missed_4k(cfg, reason, chosen, candidates):
+            return
+        cid = getattr(content_obj, "id", None)
+        if cid is None or not _claim_notification("%s:%s" % (content_type, cid)):
+            return
+        tier = quality_tier(chosen) or "unknown quality"
+        message = ("%s played %s from %s; its only 4K copy is Dolby Vision without "
+                   "an HDR/SDR fallback (Profile 5)."
+                   % (_content_label(content_obj), tier, _account_name(chosen)))
+        logger.info("[VOD-PREF] missed 4K: %s", message)
+        _notify_async(cfg, "Missed 4K", message)
+    except Exception as exc:
+        logger.debug("[VOD-PREF] missed-4K notification skipped: %s", exc)
 
 
 # --------------------------------------------------------------------------- #
@@ -1352,6 +1808,15 @@ def patched_get_content_and_relation(content_type, content_id,
                 _bitrate_label(new_relation),
                 _is_dv_no_fallback(new_relation), changed, len(new_candidates),
             )
+        # Side effects that never change the choice (each fails silently, and
+        # this guard keeps any surprise from undoing the selection above).
+        try:
+            if _record_recent_play(content_type, content_obj, new_relation):
+                _record_played_series(content_obj)
+            _maybe_notify_missed_4k(_load_config(), reason, content_type, content_obj,
+                                    new_relation, new_candidates)
+        except Exception as exc:
+            logger.debug("[VOD-PREF] post-selection bookkeeping failed: %s", exc)
         return content_obj, new_relation, new_candidates
     except Exception as exc:
         logger.error("[VOD-PREF] preference logic error, using native selection: %s", exc)
@@ -1575,3 +2040,242 @@ def clear_saved_key(raw) -> bool:
 
     _write_picks(_mutate)
     return hit["removed"]
+
+
+# --------------------------------------------------------------------------- #
+# Recent plays + avoid-rule management (used by the plugin's config actions)
+# --------------------------------------------------------------------------- #
+
+def _short(text, limit=RECENT_LABEL_CHARS) -> str:
+    text = str(text or "").strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "…"
+
+
+_EP_SUFFIX_RE = re.compile(r"\s(S\d+E\d+)$")
+
+
+def _short_label(label, limit=RECENT_LABEL_CHARS) -> str:
+    """Like _short, but an episode's trailing 'SxxEyy' always survives: only the
+    show name is shortened."""
+    label = str(label or "").strip()
+    m = _EP_SUFFIX_RE.search(label)
+    if not m or len(label) <= limit:
+        return _short(label, limit)
+    suffix = m.group(1)
+    return _short(label[: m.start()], max(8, limit - len(suffix) - 1)) + " " + suffix
+
+
+def _ago(ts) -> str:
+    try:
+        secs = max(0, time.time() - float(ts))
+    except (TypeError, ValueError):
+        return "?"
+    if secs < 3600:
+        return "%dm" % max(1, secs // 60)
+    if secs < 86400:
+        return "%dh" % (secs // 3600)
+    return "%dd" % (secs // 86400)
+
+
+def _account_names(ids) -> dict:
+    try:
+        from apps.m3u.models import M3UAccount
+        return dict(M3UAccount.objects.filter(id__in=list(ids)).values_list("id", "name"))
+    except Exception:
+        return {}
+
+
+def _resolve_play(entry):
+    """(content_obj, label) for a recent-play entry, or (None, reason)."""
+    try:
+        from apps.vod.models import Episode, Movie
+        if entry.get("type") == "episode":
+            obj = Episode.objects.select_related("series").filter(id=entry.get("cid")).first()
+        else:
+            obj = Movie.objects.filter(id=entry.get("cid")).first()
+    except Exception as exc:
+        return None, "lookup failed (%s)" % exc
+    if obj is None:
+        return None, "title no longer in the library"
+    return obj, _content_label(obj)
+
+
+def describe_recent_plays() -> list:
+    """[{n, label, account, ago, entry}] newest first, for the List action."""
+    plays = get_recent_plays()
+    names = _account_names({p.get("acct") for p in plays})
+    out = []
+    for n, p in enumerate(plays, 1):
+        _obj, label = _resolve_play(p)
+        out.append({
+            "n": n, "label": label,
+            "account": names.get(p.get("acct")) or "account %s" % p.get("acct"),
+            "ago": _ago(p.get("ts")), "entry": p,
+        })
+    return out
+
+
+def format_recent_plays(rows) -> str:
+    """One compact line (the action popup is narrow and may not keep newlines)."""
+    if not rows:
+        return ("No recent plays recorded yet. Play something through the proxy, "
+                "then list again.")
+    parts = ["#%d %s \u00b7 %s (%s)" % (r["n"], _short_label(r["label"]),
+                                       _short(r["account"], 16), r["ago"])
+             for r in rows]
+    return "Recent plays (newest first): " + "  |  ".join(parts)
+
+
+def _rule_text(rule) -> str:
+    label = _short(rule.get("label") or rule.get("key"))
+    acct = _short(rule.get("acct_name") or "account %s" % rule.get("acct"), 18)
+    if rule.get("kind") == "episode":
+        scope = "S%s" % rule.get("season") if rule.get("season") is not None else "all seasons"
+        return "%s (%s) \u00b7 %s" % (label, scope, acct)
+    return "%s \u00b7 %s stream %s" % (label, acct, rule.get("stream"))
+
+
+def _same_rule(a, b) -> bool:
+    fields = ("kind", "key", "acct", "stream")
+    return (all(a.get(f) == b.get(f) for f in fields)
+            and _rule_season(a) == _rule_season(b))
+
+
+def add_avoid_from_recent(play_number, season_only=False) -> dict:
+    """Create an avoid rule for recent play #*play_number*.
+
+    -> {"ok": bool, "message": str, "rule": dict|None}
+    Episodes avoid that PROVIDER for the show (or just that season with
+    *season_only*); movies avoid that exact copy. A saved pick that names the
+    same provider/copy would outrank the new rule, so it is removed (whole-show
+    and movie rules only; a season rule leaves the show-wide pick and says so).
+    """
+    try:
+        n = int(float(play_number))
+    except (TypeError, ValueError):
+        n = 0
+    plays = get_recent_plays()
+    if not plays:
+        return {"ok": False, "rule": None,
+                "message": "No recent plays recorded yet -- play the title first."}
+    if not 1 <= n <= len(plays):
+        return {"ok": False, "rule": None,
+                "message": "Play # must be 1-%d (see 'List recent plays')." % len(plays)}
+    entry = plays[n - 1]
+    obj, label = _resolve_play(entry)
+    if obj is None:
+        return {"ok": False, "rule": None, "message": "Play #%d: %s." % (n, label)}
+    acct = entry.get("acct")
+    acct_name = _account_names({acct}).get(acct) or "account %s" % acct
+    if entry.get("type") == "episode":
+        key = _series_key(obj)
+        if key is None:
+            return {"ok": False, "rule": None, "message": "Play #%d: show has no usable id." % n}
+        season = None
+        if season_only:
+            try:
+                season = int(obj.season_number)
+            except (TypeError, ValueError):
+                season = None
+        series_name = getattr(getattr(obj, "series", None), "name", None) or label
+        rule = {"kind": "episode", "key": key, "acct": acct, "stream": None,
+                "season": season, "label": series_name, "acct_name": acct_name,
+                "ts": time.time()}
+    else:
+        fake_rel = types.SimpleNamespace(m3u_account_id=acct, stream_id=entry.get("stream"))
+        rule = {"kind": "movie", "key": _capture_key(obj, fake_rel), "acct": acct,
+                "stream": str(entry.get("stream")), "season": None, "label": label,
+                "acct_name": acct_name, "ts": time.time()}
+
+    state = {"dup": False, "full": False}
+
+    def _mutate(rules):
+        if any(_same_rule(r, rule) for r in rules):
+            state["dup"] = True
+            return False
+        if len(rules) >= MAX_AVOID_RULES:
+            state["full"] = True
+            return False
+        rules.append(rule)
+        return True
+
+    _write_avoid(_mutate)
+    if state["dup"]:
+        return {"ok": True, "rule": rule, "message": "Already avoiding: %s." % _rule_text(rule)}
+    if state["full"]:
+        return {"ok": False, "rule": None,
+                "message": "Avoid-rule limit (%d) reached; remove some first." % MAX_AVOID_RULES}
+
+    note = ""
+    pick = (get_saved_picks() or {}).get(rule["key"])
+    if isinstance(pick, dict) and pick.get("m3u_account_id") == acct:
+        same_copy = rule["kind"] == "episode" or str(pick.get("stream_id")) == rule["stream"]
+        if same_copy and rule.get("season") is None:
+            clear_saved_key(rule["key"])
+            note = " Removed the saved pick that chose this copy."
+        elif same_copy:
+            note = (" Note: a saved pick for the whole show chooses this provider and "
+                    "outranks this rule; clear '%s' to let it apply." % rule["key"])
+    logger.info("[VOD-PREF] avoid rule added: %s", _rule_text(rule))
+    return {"ok": True, "rule": rule, "message": "Now avoiding: %s.%s" % (_rule_text(rule), note)}
+
+
+def get_avoid_rules() -> list:
+    """The avoid rules straight from the DB (uncached), oldest first."""
+    try:
+        return _read_avoid_from_db()
+    except Exception as exc:
+        logger.error("[VOD-PREF] could not read avoid rules: %s", exc)
+        return []
+
+
+def format_avoid_rules(rules) -> str:
+    """Numbered (stable: #1 = oldest), newest shown first, capped for the popup."""
+    if not rules:
+        return "No avoid rules."
+    numbered = list(enumerate(rules, 1))[::-1]
+    shown = numbered[:AVOID_LIST_SHOWN]
+    parts = ["#%d %s" % (n, _rule_text(r)) for n, r in shown]
+    head = "%d avoid rule(s)" % len(rules)
+    if len(rules) > len(shown):
+        head += ", newest %d shown" % len(shown)
+    return head + ": " + "  |  ".join(parts)
+
+
+def remove_avoid_rule(rule_number) -> dict:
+    """Remove avoid rule #*rule_number* (as numbered by the List action)."""
+    try:
+        n = int(float(rule_number))
+    except (TypeError, ValueError):
+        n = 0
+    removed = {}
+
+    def _mutate(rules):
+        if 1 <= n <= len(rules):
+            removed["rule"] = rules.pop(n - 1)
+            return True
+        removed["count"] = len(rules)
+        return False
+
+    _write_avoid(_mutate)
+    if "rule" in removed:
+        return {"ok": True, "message": "Removed avoid rule #%d: %s. Later rules move up "
+                                       "one number." % (n, _rule_text(removed["rule"]))}
+    return {"ok": False, "message": "No avoid rule #%s (there are %d)." % (
+        rule_number, removed.get("count", 0))}
+
+
+def clear_all_avoid() -> int:
+    """Remove every avoid rule. Returns how many were removed."""
+    removed = {"n": 0}
+
+    def _mutate(rules):
+        removed["n"] = len(rules)
+        if not rules:
+            return False
+        del rules[:]
+        return True
+
+    _write_avoid(_mutate)
+    logger.info("[VOD-PREF] cleared %d avoid rule(s)", removed["n"])
+    return removed["n"]

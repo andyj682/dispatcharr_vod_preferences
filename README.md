@@ -32,6 +32,14 @@ clients. It adds several independent, composable controls:
    rank a copy whose video bitrate is clearly too low for its resolution (a
    heavily squeezed re-encode) after the healthy copies, and let a clearly higher
    bitrate break any remaining tie.
+6. **Avoid a bad copy** — when something plays badly (out-of-sync audio, the
+   wrong cut, burned-in subtitles…), mark it from a short list of recent plays.
+   For TV that avoids the provider for the whole show (or just that season); for
+   a movie it avoids that exact copy. An avoided copy is served only if nothing
+   else plays.
+7. **Missed-4K alert** *(optional)* — a Prowl and/or webhook notification when a
+   title plays below 4K because its only 4K copy is Dolby Vision without a
+   fallback, so you can decide whether to stop and pick something else.
 
 You still get Dispatcharr's provider slot management and failover; this plugin
 only re-orders the candidate list Dispatcharr already built. It works with a
@@ -123,6 +131,23 @@ Plugins page → **VOD Preferences** → **Settings** tab:
   the bottom 5% of each tier counts as low-bitrate. Set a tier to `0` to
   turn its minimum off.
 - **Title key to clear** — a text box used only by the **Clear one** action below.
+- **Recent play # to avoid** — which entry from **List recent plays** the
+  **Avoid copy** button marks (default `1`, the most recent).
+- **Avoid just that season (TV)** — on/off (default **off**). Off: a TV avoid
+  rule covers the whole show. On: only the season of the episode you picked.
+  Ignored for movies, which always avoid one exact copy.
+- **Avoid rule # to remove** — the number shown by **List avoid rules**, for the
+  **Remove rule** button.
+- **Notify on missed 4K** — on/off (default **off**). Alerts when a title plays
+  below 4K because every 4K copy is Dolby Vision without an HDR/SDR fallback.
+  Needs **Prefer 4K** and **Avoid Dolby Vision without HDR/SDR fallback** on, and
+  a Prowl key and/or webhook. At most one alert per title per day. No alert when
+  you chose the copy yourself (a UI play or a saved pick).
+- **Prowl API key** / **Webhook URL** — where alerts go; either or both. The
+  webhook receives a JSON `POST` with `title`, `message`, `text` and `content`
+  fields (`text`/`content` let Slack-, Discord- or Mattermost-style webhooks show
+  it as-is). Sending happens in the background with a 5-second timeout and never
+  delays playback.
 
 **Actions** tab:
 
@@ -132,9 +157,25 @@ Plugins page → **VOD Preferences** → **Settings** tab:
   what each stream-serving worker recorded when it installed the patch.)
 - **List saved picks** — dump the remembered map (`title key → provider/stream`).
 - **Clear one** — type a pick's key (from *List saved picks*, e.g. `tmdb:954` or
-  `series:…`, or a bare tmdb/imdb id) into the **Title key to clear** box on the
-  Settings tab, then click this.
+  `series:…`, or a bare tmdb/imdb id) into the **Title key to clear** box, then
+  click this.
 - **Clear all** — wipe every saved pick (quality preference untouched).
+- **List recent plays** — the last 5 titles the proxy served, newest first, each
+  with the provider it played from, e.g. `#1 Example Show S02E03 · Provider A (4m)`.
+- **Avoid copy** — mark the play chosen in **Recent play # to avoid** as a
+  bad copy. If a saved pick
+  pointed at that same copy or provider, it's removed so the rule can apply (a
+  season-only rule leaves a show-wide pick in place and tells you).
+- **List avoid rules** / **Remove rule** — review rules (numbered, newest shown
+  first) and remove one by number. Later rules move up one number.
+- **Clear all avoid rules** — wipe every avoid rule (asks first; saved picks
+  untouched).
+- **Send test** — send a test alert to the configured Prowl key and/or webhook.
+
+**Typical avoid flow.** Something looks or sounds wrong in your player → open the
+plugin in Dispatcharr → **List recent plays** → set **Recent play # to avoid**
+(and **Avoid just that season** if you want) → **Avoid copy**. The next play of that
+title, or any episode of that show, skips that copy.
 
 ---
 
@@ -147,8 +188,12 @@ most-specific-first:
 |---|------|---------------|
 | 1 | **Explicit request pick** | The request named a specific stream (`stream_id`, movie UI play) or provider (`m3u_account_id`, series/episode UI play). Passed through untouched; if *Remember my UI pick* is on, it's saved as this title's default. |
 | 2 | **Saved UI pick** | A remembered pick for this title. **Movies** pin the exact `(provider, stream)`. **TV pins the provider for the whole series** and still applies the quality rule *within* that provider (so Prefer 4K picks the 4K copy when one provider carries both). Dropped automatically if the provider no longer carries the title. |
-| 3 | **Quality rule / DV-avoidance** | *Prefer quality* is set and/or *Avoid DV without fallback* is on. Candidates are stable-sorted by a composite key: DV-without-fallback demotion (top, when enabled) → video quality → low-bitrate demotion (when *Avoid low-bitrate copies* is on) → audio (when *Prefer better audio* is on) → higher bitrate (when *Avoid low-bitrate copies* is on). The best becomes primary and failover follows that order. |
+| 3 | **DV-avoidance / avoid rules / quality rule** | *Avoid DV without fallback* is on, an avoid rule covers a copy, and/or *Prefer quality* is set. Candidates are stable-sorted by a composite key: DV-without-fallback demotion (top, when enabled) → avoid rules → video quality → low-bitrate demotion (when *Avoid low-bitrate copies* is on) → audio (when *Prefer better audio* is on) → higher bitrate (when *Avoid low-bitrate copies* is on). The best becomes primary and failover follows that order. Avoid rules rank below DV-avoidance on purpose: "avoid" means *anything else that plays*, and a no-fallback DV copy doesn't play properly where that setting is on. |
 | 4 | **Native** | None of the above — untouched account priority. |
+
+An explicit pick (rules 1 and 2) outranks an avoid rule: if you choose a copy, you
+get it. Avoided copies are never removed, only moved to the end of the failover
+list.
 
 Streams with no quality signal keep their native account-priority order (the sort
 is stable), so the plugin never reshuffles titles it has no opinion about, and
@@ -220,7 +265,8 @@ be on** — the saved pick supplies the provider, Prefer 4K supplies the quality
 - **Saved picks survive a delete.** They live in their own `CoreSettings` row
   (not the plugin's config), so deleting the plugin leaves them (and reuses them
   if you reinstall). Click **Clear all** first if you want them gone. No changes
-  are made to Dispatcharr's own VOD tables.
+  are made to Dispatcharr's own VOD tables. Avoid rules work the same way (their
+  own row); click **Clear all avoid rules** first if you want them gone.
 
 ---
 
@@ -274,7 +320,8 @@ ranking and decision for any episode straight from the current database — no
 log-level change needed. It loads the installed `patch.py` and runs the real
 ranking logic, showing the native candidate order, the plugin's pick (and why),
 and the pure ranking with `avoid_dv` off/on. Each candidate line shows its tier,
-audio, bitrate, whether it counts as low-bitrate (`starved`), and its category
+audio, bitrate (H.264-equivalent, with the codec and, for HEVC/AV1/VP9, the actual
+bitrate in brackets), whether it counts as low-bitrate (`starved`), and its category
 quality tag if one applies. Edit the `-e` variables at the top
 (a movie or episode ID, or a title + season + episode) and run it on the
 Dispatcharr host. Especially handy when playback differs from what you expect: if the
@@ -322,7 +369,8 @@ cover-image exclusion, name/category/account fallbacks, word-boundary guards),
 the low-bitrate rule (bitrate reading in both storage units, codec credit,
 starved demotion, the bitrate tiebreak), movie exact picks, TV show-level picks +
 same-account 4K composition, capture via stream_id/account_id, persistence, the
-Status worker registry, and clear operations. No Dispatcharr or DB required.
+Status worker registry, avoid rules and recent plays, the missed-4K alert, and
+clear operations. No Dispatcharr or DB required.
 
 ---
 
@@ -376,15 +424,51 @@ Status worker registry, and clear operations. No Dispatcharr or DB required.
   server-side. Movie keys: `tmdb:` → `imdb:` → `as:<account>:<stream>`. TV keys
   (per series): `stmdb:` → `simdb:` → `series:<uuid>`. Picks from a pre-1.0
   install migrate across automatically on first write.
+- **Avoid rules:** a second `CoreSettings` row, `key =
+  dispatcharr_vod_preferences_avoid`, value `{"rules": [...]}`. Each rule records
+  the title key (same key forms as saved picks), the provider, the stream (movies)
+  or season (season-only TV rules), and a label for display.
 - **Settings** (`prefer_quality`, `remember_ui_picks`, `prefer_audio`,
-  `avoid_dv_no_fallback`, `avoid_low_bitrate`, `min_bitrate_*`, `clear_key`): the
-  plugin's normal `PluginConfig.settings`.
+  `avoid_dv_no_fallback`, `avoid_low_bitrate`, `min_bitrate_*`, `clear_key`,
+  `avoid_play_number`, `avoid_season_only`, `avoid_rule_to_remove`,
+  `notify_missed_4k`, `prowl_api_key`, `webhook_url`): the plugin's normal
+  `PluginConfig.settings`.
+- **Recent plays:** a short Redis list, `dispatcharr_vod_preferences:recent`
+  (the last 5 distinct titles: content id, provider, stream, time).
+- **Played shows:** a `CoreSettings` row, `key =
+  dispatcharr_vod_preferences_played` — which shows were watched recently and how
+  far (see *For other plugins* below). Kept in the database rather than Redis so
+  it survives container restarts.
+- **Alert de-duplication:** Redis keys
+  `dispatcharr_vod_preferences:notified:<type>:<id>` that expire after a day.
 - **Worker status** (for **Check status**): a small Redis hash,
   `dispatcharr_vod_preferences:workers`, with one entry per process that installed
   the patch (pid, role, active, time). Entries for exited processes are pruned
   automatically.
 
 Dispatcharr's own VOD tables are never modified.
+
+### For other plugins: the played-shows record
+
+Other plugins may read (never write) the played-shows row to focus work on shows
+that are actually being watched, for example to enrich or pre-convert upcoming
+episodes. Format (`version` 1):
+
+```json
+{"version": 1,
+ "series": {"<Series.id>": {"ts": 1764240000.0, "season": 2, "episode": 5,
+                            "episode_id": 4321, "max_season": 2, "max_episode": 5}}}
+```
+
+- Keyed by Dispatcharr's `Series.id` (as a string).
+- `season`/`episode`/`episode_id`: the latest episode played; `max_season`/
+  `max_episode`: the furthest episode reached (a rewatch of an earlier episode
+  doesn't move it back).
+- `ts`: when that latest play happened (Unix seconds).
+- Updated once per new episode play through the proxy (UI or client). Shows not
+  played for 60 days drop out.
+- A reader should treat a missing row (this plugin not installed, or nothing
+  played yet) as "no signal", and ignore a `version` it doesn't know.
 
 ---
 

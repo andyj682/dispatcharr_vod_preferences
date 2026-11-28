@@ -33,11 +33,13 @@
 # (provider at capacity -> failover, or idle-session reuse), NOT the plugin.
 
 docker exec -i \
+  -e PYTHONDONTWRITEBYTECODE=1 \
   -e KIND="episode" \
   -e ID="" \
   -e TITLE="Example Show" \
   -e SEASON="1" -e EPISODE="1" \
   dispatcharr python manage.py shell << 'PY'
+import sys; sys.dont_write_bytecode = True  # never leave root-owned __pycache__ in /data/plugins
 import os, re, importlib, importlib.util
 try:
     vp = importlib.import_module('dispatcharr_vod_preferences.patch')
@@ -79,6 +81,8 @@ else:
 cfg = vp._load_config(force=True)
 
 HAS_BITRATE = hasattr(vp, 'effective_mbps')      # 1.4.0+
+HAS_AVOID = hasattr(vp, '_avoided_ids')          # 1.5.0+
+AVOIDED = set()
 floors = cfg.get('min_bitrate') if cfg.get('avoid_low_bitrate') else None
 
 def row(c):
@@ -88,10 +92,16 @@ def row(c):
     if HAS_BITRATE:
         mbps = vp.effective_mbps(c)
         out += f" bitrate={'%.2f' % mbps if mbps is not None else None}"
+        codec = str((vp._first_video(c) or {}).get('codec_name') or '').strip().lower()
+        if mbps is not None:
+            factor = vp._CODEC_EFFICIENCY.get(codec, 1.0)
+            out += f" ({codec or 'codec?'} {mbps / factor:.2f} actual)" if factor != 1.0 else f" ({codec or 'codec?'})"
         out += f" starved={vp.is_starved(c, cfg.get('min_bitrate'))}"
         cat = getattr(c, vp._CAT_TIER_ATTR, None)
         if cat:
             out += f" category_tag={cat}"
+    if c.id in AVOIDED:
+        out += " AVOIDED"
     return out
 
 print(label)
@@ -116,6 +126,10 @@ else:
     keys = [f"stmdb:{s.tmdb_id}", f"simdb:{s.imdb_id}", f"series:{s.uuid}"]
     hits = {k: picks[k] for k in keys if k in picks}
 print("SAVED PICK:", hits or "none")
+if HAS_AVOID:
+    AVOIDED = vp._avoided_ids(obj, cands, cfg.get('avoid_rules'))
+    print(f"AVOID RULES: {len(cfg.get('avoid_rules') or [])} total, "
+          f"{len(AVOIDED)} candidate(s) covered here")
 
 print("\nNATIVE ORDER (Dispatcharr account priority, then id):")
 for i, c in enumerate(cands):
@@ -131,7 +145,11 @@ else:
 
     print("\nDETERMINISTIC RANKING under prefer=4k (independent of session/capacity):")
     for av in (False, True):
-        r = (vp._quality_ranked(cands, "4k", cfg['prefer_audio'], av, floors) if HAS_BITRATE
-             else vp._quality_ranked(cands, "4k", cfg['prefer_audio'], av))
+        if HAS_AVOID:
+            r = vp._quality_ranked(cands, "4k", cfg['prefer_audio'], av, floors, AVOIDED)
+        elif HAS_BITRATE:
+            r = vp._quality_ranked(cands, "4k", cfg['prefer_audio'], av, floors)
+        else:
+            r = vp._quality_ranked(cands, "4k", cfg['prefer_audio'], av)
         print(f"  avoid_dv={av} -> " + str([(c.m3u_account.name, c.stream_id, vp.quality_tier(c)) for c in r]))
 PY

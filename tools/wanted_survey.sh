@@ -34,10 +34,12 @@
 #   * H.264 equivalent: HEVC/AV1 x1.5, VP9 x1.3, MPEG-2 x0.6, MPEG-4 x0.8.
 
 docker exec -i \
+  -e PYTHONDONTWRITEBYTECODE=1 \
   -e SCOPE="wanted" \
   -e WORST="15" \
   -e FLOOR="" \
   dispatcharr python manage.py shell << 'PY'
+import sys; sys.dont_write_bytecode = True  # never leave root-owned __pycache__ in /data/plugins
 import os, json, importlib, importlib.util
 from collections import Counter, defaultdict
 try:
